@@ -18,6 +18,17 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j2
 ```
 
+### Open directly in Qt Creator
+
+Open `MatricScopePI.pro` in Qt Creator and select the Raspberry Pi Qt kit. The
+qmake project includes every native `.cpp`/`.h` file and enables Widgets, SQL,
+PrintSupport, SerialPort, OpenCV 4, and the Hikrobot MVS SDK. If MVS is not
+installed in `/opt/MVS`, add `MVCAMERA_ROOT=/your/mvs/path` to the selected
+kit's build environment, rerun qmake, and rebuild.
+
+Qt Creator creates build output outside the source directory by default. The
+executable is placed in that build directory's `bin` folder.
+
 Install Hikrobot's Linux ARM MVS SDK under `/opt/MVS` (or set
 `MVCAMERA_ROOT` to its location), copy `DiamondRules.xml` beside the executable,
 and run:
