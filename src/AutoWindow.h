@@ -3,10 +3,10 @@
 #include "MeasurementEngine.h"
 #include "RuleStore.h"
 #include "HistoryStore.h"
+#include "MvCameraBackend.h"
 
 #include <QMainWindow>
 #include <QTimer>
-#include <opencv2/videoio.hpp>
 
 class QLabel;
 class QPushButton;
@@ -44,7 +44,7 @@ private:
     QLabel *m_modeLabel;
     QLabel *m_profileLabel;
     QTimer m_timer;
-    cv::VideoCapture m_camera;
+    MvCameraBackend m_camera;
     cv::Mat m_lastFrame;
     MeasurementEngine m_engine;
     RuleStore m_rules;

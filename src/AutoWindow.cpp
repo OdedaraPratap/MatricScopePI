@@ -38,7 +38,7 @@ AutoWindow::AutoWindow(QWidget *parent)
     m_timer.start(50);
 }
 
-AutoWindow::~AutoWindow() { m_camera.release(); }
+AutoWindow::~AutoWindow() { m_camera.close(); }
 
 void AutoWindow::buildUi()
 {
@@ -122,21 +122,19 @@ void AutoWindow::buildUi()
 
 void AutoWindow::openCamera()
 {
-    if (!m_camera.open(0, cv::CAP_ANY)) {
-        m_status->setText(tr("Camera 0 is not available"));
+    QString error;
+    if (!m_camera.open(&error)) {
+        m_status->setText(error);
         return;
     }
-    m_camera.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
-    m_camera.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
-    m_camera.set(cv::CAP_PROP_BUFFERSIZE, 1);
-    m_status->setText(tr("Camera ready — capture an empty background"));
+    m_status->setText(tr("%1 ready — capture an empty background").arg(m_camera.backendName()));
 }
 
 void AutoWindow::readFrame()
 {
-    if (!m_camera.isOpened()) return;
+    if (!m_camera.isOpen()) return;
     cv::Mat frame;
-    if (!m_camera.read(frame) || frame.empty()) return;
+    if (!m_camera.read(&frame) || frame.empty()) return;
     frame.copyTo(m_lastFrame);
     showFrame(frame);
     if (!m_measurementArmed) {
@@ -252,9 +250,9 @@ void AutoWindow::openCameraSettings()
     CameraSettingsDialog dialog(this);
     connect(&dialog, &CameraSettingsDialog::settingsChanged,
             [this](double exposure, double gain, double gamma) {
-        m_camera.set(cv::CAP_PROP_EXPOSURE, exposure);
-        m_camera.set(cv::CAP_PROP_GAIN, gain);
-        m_camera.set(cv::CAP_PROP_GAMMA, gamma);
+        m_camera.setExposure(exposure);
+        m_camera.setGain(gain);
+        m_camera.setGamma(gamma);
     });
     dialog.exec();
 }

@@ -18,8 +18,9 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j2
 ```
 
-Copy `DiamondRules.xml` beside the executable (the install target does this),
-connect a V4L2-compatible camera as camera index 0, and run:
+Install Hikrobot's Linux ARM MVS SDK under `/opt/MVS` (or set
+`MVCAMERA_ROOT` to its location), copy `DiamondRules.xml` beside the executable,
+and run:
 
 ```bash
 ./build/MatricScopePI
@@ -39,7 +40,16 @@ password protection, history database, printing, serial bin output, XML rule
 storage, and OpenCV measurement pipeline.
 
 Windows-only integrations are mapped to Raspberry Pi interfaces:
-`uEye`/`MvCameraControl` acquisition uses OpenCV's V4L2 capture, the Windows
+camera acquisition uses Hikrobot's native `MvCameraControl` Linux SDK, the Windows
 Registry uses `QSettings`, GDI/Skia printing uses `QPrinter`,
 `System.Data.SQLite` uses Qt SQL's SQLite driver, and COM-port output defaults
 to `/dev/ttyUSB0`. The port can be changed with the `serial/port` QSettings key.
+
+The build searches for `MvCameraControl.h` and `libMvCameraControl.so` in the
+standard `/opt/MVS` ARM locations and in `MVCAMERA_ROOT`. When the SDK is found,
+the application enumerates GigE/USB MVS devices, opens the first camera with
+exclusive access, starts continuous acquisition, obtains frames with
+`MV_CC_GetImageBuffer`, converts vendor pixel formats to BGR, and releases each
+SDK buffer. OpenCV/V4L2 is retained only as a build-time fallback for development
+machines without the MVS SDK; disable SDK probing explicitly with
+`-DMATRIC_USE_MVCAMERA=OFF`.
