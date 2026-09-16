@@ -1,4 +1,4 @@
-QT += core gui widgets sql printsupport serialport
+QT += core gui widgets sql
 
 TEMPLATE = app
 TARGET = MatricScopePI
@@ -23,7 +23,8 @@ SOURCES += \
     src/SettingsDialog.cpp \
     src/ApplicationDialogs.cpp \
     src/HistoryStore.cpp \
-    src/MvCameraBackend.cpp
+    src/MvCameraBackend.cpp \
+    src/GpioController.cpp
 
 HEADERS += \
     src/AutoWindow.h \
@@ -32,12 +33,21 @@ HEADERS += \
     src/SettingsDialog.h \
     src/ApplicationDialogs.h \
     src/HistoryStore.h \
-    src/MvCameraBackend.h
+    src/MvCameraBackend.h \
+    src/GpioController.h
 
 OTHER_FILES += \
     README-Qt.md \
     DiamondRules.xml \
     CMakeLists.txt
+
+packagesExist(libgpiod) {
+    PKGCONFIG += libgpiod
+    DEFINES += MATRIC_HAS_GPIOD=1
+    message(Raspberry Pi GPIO output enabled with libgpiod)
+} else {
+    warning(libgpiod was not found; GPIO bin output will be disabled)
+}
 
 # The Hikrobot Linux ARM MVS installer normally uses /opt/MVS. Qt Creator can
 # override this by defining MVCAMERA_ROOT in Projects > Build Environment.

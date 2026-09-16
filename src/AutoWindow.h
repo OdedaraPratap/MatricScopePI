@@ -4,13 +4,13 @@
 #include "RuleStore.h"
 #include "HistoryStore.h"
 #include "MvCameraBackend.h"
+#include "GpioController.h"
 
 #include <QMainWindow>
 #include <QTimer>
 
 class QLabel;
 class QPushButton;
-class QSerialPort;
 
 class AutoWindow : public QMainWindow
 {
@@ -29,7 +29,6 @@ private slots:
     void chooseCalibration();
     void openCameraSettings();
     void openHistory();
-    void openPrint();
     void openVariation();
 
 private:
@@ -49,7 +48,7 @@ private:
     MeasurementEngine m_engine;
     RuleStore m_rules;
     HistoryStore m_history;
-    QSerialPort *m_serial;
+    GpioController m_gpio;
     QString m_mode;
     QString m_profile;
     bool m_measurementArmed;

@@ -8,7 +8,7 @@ repository as a migration reference; it is not compiled by CMake.
 
 ```bash
 sudo apt install build-essential cmake qtbase5-dev libqt5sql5-sqlite \
-  libqt5serialport5-dev libopencv-dev
+  libgpiod-dev gpiod libopencv-dev
 ```
 
 ## Build
@@ -22,7 +22,7 @@ cmake --build build -j2
 
 Open `MatricScopePI.pro` in Qt Creator and select the Raspberry Pi Qt kit. The
 qmake project includes every native `.cpp`/`.h` file and enables Widgets, SQL,
-PrintSupport, SerialPort, OpenCV 4, and the Hikrobot MVS SDK. If MVS is not
+OpenCV 4, Raspberry Pi GPIO through libgpiod, and the Hikrobot MVS SDK. If MVS is not
 installed in `/opt/MVS`, add `MVCAMERA_ROOT=/your/mvs/path` to the selected
 kit's build environment, rerun qmake, and rebuild.
 
@@ -47,14 +47,24 @@ use **CALIBRATE** to enter the camera's pixels-per-millimetre value.
 The CMake target is independent of the WinForms project and contains native
 replacements for the application entry point, automatic measurement screen,
 camera settings, calibration, tray/rule settings, measurement variation,
-password protection, history database, printing, serial bin output, XML rule
+password protection, history database, Raspberry Pi GPIO bin output, XML rule
 storage, and OpenCV measurement pipeline.
 
 Windows-only integrations are mapped to Raspberry Pi interfaces:
 camera acquisition uses Hikrobot's native `MvCameraControl` Linux SDK, the Windows
-Registry uses `QSettings`, GDI/Skia printing uses `QPrinter`,
-`System.Data.SQLite` uses Qt SQL's SQLite driver, and COM-port output defaults
-to `/dev/ttyUSB0`. The port can be changed with the `serial/port` QSettings key.
+Registry uses `QSettings`, and `System.Data.SQLite` uses Qt SQL's SQLite driver.
+Printing and serial-port dependencies are not included in the native target.
+
+### Raspberry Pi GPIO bin output
+
+Matched bin numbers are emitted as a five-bit value using libgpiod. The default
+BCM lines are GPIO17 (bit 0), GPIO27 (bit 1), GPIO22 (bit 2), GPIO23 (bit 3),
+GPIO25 (bit 4), with GPIO24 as a 25 ms active-high strobe. This represents bin
+numbers 0–31 and therefore covers all 20 tray positions.
+The line numbers and chip can be changed with these `QSettings` keys:
+`gpio/data0`, `gpio/data1`, `gpio/data2`, `gpio/data3`, `gpio/data4`, `gpio/strobe`, and
+`gpio/chip` (default `gpiochip0`). The application user must have permission to
+access `/dev/gpiochip0`.
 
 The build searches for `MvCameraControl.h` and `libMvCameraControl.so` in the
 standard `/opt/MVS` ARM locations and in `MVCAMERA_ROOT`. When the SDK is found,

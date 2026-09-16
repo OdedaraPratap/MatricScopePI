@@ -1,7 +1,6 @@
 #pragma once
 
 #include "HistoryStore.h"
-#include "RuleStore.h"
 
 #include <QDialog>
 
@@ -9,7 +8,6 @@ class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QLineEdit;
-class QSerialPort;
 class QSqlQueryModel;
 class QTableView;
 
@@ -55,19 +53,6 @@ private:
     QComboBox *m_shape;
     QTableView *m_table;
     QSqlQueryModel *m_model;
-};
-
-class PrintDialog : public QDialog
-{
-    Q_OBJECT
-public:
-    explicit PrintDialog(RuleStore *rules, QWidget *parent = 0);
-private slots:
-    void printRules();
-private:
-    RuleStore *m_rules;
-    QComboBox *m_profile;
-    QComboBox *m_printer;
 };
 
 class PasswordDialog : public QDialog

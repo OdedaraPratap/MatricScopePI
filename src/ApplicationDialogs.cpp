@@ -11,15 +11,11 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
-#include <QPrinter>
-#include <QPrinterInfo>
-#include <QPrintDialog>
 #include <QPushButton>
 #include <QSettings>
 #include <QSqlQuery>
 #include <QSqlQueryModel>
 #include <QTableView>
-#include <QTextDocument>
 #include <QVBoxLayout>
 
 namespace {
@@ -122,31 +118,6 @@ void HistoryDialog::removeSelected()
     const int id = m_model->index(m_table->currentIndex().row(), 0).data().toInt();
     QSqlQuery query(m_store->database()); query.prepare("DELETE FROM Records WHERE ID=?");
     query.addBindValue(id); query.exec(); filter();
-}
-
-PrintDialog::PrintDialog(RuleStore *rules, QWidget *parent)
-    : QDialog(parent), m_rules(rules), m_profile(new QComboBox(this)), m_printer(new QComboBox(this))
-{
-    setWindowTitle(tr("Print Tray Rules")); styleDialog(this); m_profile->addItems(rules->profiles());
-    const QList<QPrinterInfo> printers = QPrinterInfo::availablePrinters();
-    for (int i = 0; i < printers.size(); ++i) m_printer->addItem(printers.at(i).printerName());
-    QFormLayout *layout = new QFormLayout(this); layout->addRow(tr("Profile"), m_profile); layout->addRow(tr("Printer"), m_printer);
-    QPushButton *print = new QPushButton(tr("PRINT"), this); layout->addWidget(print);
-    connect(print, SIGNAL(clicked()), this, SLOT(printRules()));
-}
-
-void PrintDialog::printRules()
-{
-    QPrinter printer; if (!m_printer->currentText().isEmpty()) printer.setPrinterName(m_printer->currentText());
-    QPrintDialog dialog(&printer, this); if (dialog.exec() != QDialog::Accepted) return;
-    QString html = QStringLiteral("<h2>Matric Scope — %1</h2><table border='1' cellspacing='0' cellpadding='5'>").arg(m_profile->currentText());
-    const QVector<MeasurementRule> rules = m_rules->rules();
-    for (int i = 0; i < rules.size(); ++i) if (rules.at(i).profile == m_profile->currentText()) {
-        const MeasurementRule &r = rules.at(i);
-        html += QStringLiteral("<tr><td>%1</td><td>%2</td><td>%3–%4</td><td>%5–%6</td></tr>")
-            .arg(r.number).arg(r.shape).arg(r.fromLength).arg(r.toLength).arg(r.fromWidth).arg(r.toWidth);
-    }
-    html += QStringLiteral("</table>"); QTextDocument document; document.setHtml(html); document.print(&printer); accept();
 }
 
 PasswordDialog::PasswordDialog(QWidget *parent)

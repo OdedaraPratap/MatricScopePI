@@ -12,8 +12,6 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QPixmap>
-#include <QSerialPort>
-#include <QSerialPortInfo>
 #include <QSettings>
 #include <QSizePolicy>
 #include <QVBoxLayout>
@@ -22,18 +20,16 @@
 
 AutoWindow::AutoWindow(QWidget *parent)
     : QMainWindow(parent), m_preview(0), m_status(0), m_modeLabel(0),
-      m_profileLabel(0), m_serial(new QSerialPort(this)), m_mode(QStringLiteral("Round")),
+      m_profileLabel(0), m_mode(QStringLiteral("Round")),
       m_profile(QStringLiteral("Default_Profile")), m_measurementArmed(true)
 {
     buildUi();
     QString error;
     if (!m_rules.load(&error)) m_status->setText(tr("Rules warning: %1").arg(error));
     m_history.open();
-    const QString serialName = QSettings().value("serial/port", QStringLiteral("/dev/ttyUSB0")).toString();
-    m_serial->setPortName(serialName);
-    m_serial->setBaudRate(QSerialPort::Baud9600);
-    m_serial->open(QIODevice::WriteOnly);
     openCamera();
+    QString gpioError;
+    if (!m_gpio.open(&gpioError)) m_status->setText(tr("GPIO warning: %1").arg(gpioError));
     connect(&m_timer, SIGNAL(timeout()), this, SLOT(readFrame()));
     m_timer.start(50);
 }
@@ -91,19 +87,17 @@ void AutoWindow::buildUi()
     QPushButton *stop = new QPushButton(tr("STOP"), buttonPanel);
     QPushButton *camera = new QPushButton(tr("CAMERA"), buttonPanel);
     QPushButton *history = new QPushButton(tr("HISTORY"), buttonPanel);
-    QPushButton *print = new QPushButton(tr("PRINT"), buttonPanel);
     QPushButton *variation = new QPushButton(tr("VARIATION"), buttonPanel);
     buttons->addWidget(background, 4, 0); buttons->addWidget(calibrate, 4, 1);
     buttons->addWidget(settings, 5, 0); buttons->addWidget(stop, 5, 1);
     buttons->addWidget(camera, 6, 0); buttons->addWidget(history, 6, 1);
-    buttons->addWidget(print, 7, 0); buttons->addWidget(variation, 7, 1);
+    buttons->addWidget(variation, 7, 0, 1, 2);
     connect(background, SIGNAL(clicked()), this, SLOT(captureBackground()));
     connect(calibrate, SIGNAL(clicked()), this, SLOT(chooseCalibration()));
     connect(settings, SIGNAL(clicked()), this, SLOT(openSettings()));
     connect(stop, SIGNAL(clicked()), this, SLOT(stopMeasurement()));
     connect(camera, SIGNAL(clicked()), this, SLOT(openCameraSettings()));
     connect(history, SIGNAL(clicked()), this, SLOT(openHistory()));
-    connect(print, SIGNAL(clicked()), this, SLOT(openPrint()));
     connect(variation, SIGNAL(clicked()), this, SLOT(openVariation()));
 
     QHBoxLayout *body = new QHBoxLayout;
@@ -196,7 +190,11 @@ void AutoWindow::performMeasurement(const cv::Mat &frame)
     record.measuredAt = QDateTime::currentDateTime(); record.profile = m_profile;
     record.shape = m_mode; record.bin = bin; record.measurement = result;
     m_history.append(record);
-    if (bin > 0 && m_serial->isOpen()) m_serial->write(QString::number(bin).toLatin1() + '\n');
+    if (bin > 0) {
+        QString gpioError;
+        if (!m_gpio.writeBin(bin, &gpioError))
+            m_status->setText(tr("%1   GPIO: %2").arg(m_status->text(), gpioError));
+    }
 }
 
 int AutoWindow::matchingBin(const MeasurementResult &result) const
@@ -260,11 +258,6 @@ void AutoWindow::openCameraSettings()
 void AutoWindow::openHistory()
 {
     HistoryDialog dialog(&m_history, this); dialog.exec();
-}
-
-void AutoWindow::openPrint()
-{
-    PrintDialog dialog(&m_rules, this); dialog.exec();
 }
 
 void AutoWindow::openVariation()
