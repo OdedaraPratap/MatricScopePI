@@ -2,6 +2,7 @@
 
 #include "MeasurementEngine.h"
 #include "RuleStore.h"
+#include "HistoryStore.h"
 
 #include <QMainWindow>
 #include <QTimer>
@@ -9,6 +10,7 @@
 
 class QLabel;
 class QPushButton;
+class QSerialPort;
 
 class AutoWindow : public QMainWindow
 {
@@ -25,6 +27,10 @@ private slots:
     void openSettings();
     void stopMeasurement();
     void chooseCalibration();
+    void openCameraSettings();
+    void openHistory();
+    void openPrint();
+    void openVariation();
 
 private:
     void buildUi();
@@ -42,6 +48,8 @@ private:
     cv::Mat m_lastFrame;
     MeasurementEngine m_engine;
     RuleStore m_rules;
+    HistoryStore m_history;
+    QSerialPort *m_serial;
     QString m_mode;
     QString m_profile;
     bool m_measurementArmed;

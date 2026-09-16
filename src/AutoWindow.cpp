@@ -1,4 +1,5 @@
 #include "AutoWindow.h"
+#include "ApplicationDialogs.h"
 #include "SettingsDialog.h"
 
 #include <QApplication>
@@ -11,6 +12,9 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QPixmap>
+#include <QSerialPort>
+#include <QSerialPortInfo>
+#include <QSettings>
 #include <QSizePolicy>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -18,12 +22,17 @@
 
 AutoWindow::AutoWindow(QWidget *parent)
     : QMainWindow(parent), m_preview(0), m_status(0), m_modeLabel(0),
-      m_profileLabel(0), m_mode(QStringLiteral("Round")),
+      m_profileLabel(0), m_serial(new QSerialPort(this)), m_mode(QStringLiteral("Round")),
       m_profile(QStringLiteral("Default_Profile")), m_measurementArmed(true)
 {
     buildUi();
     QString error;
     if (!m_rules.load(&error)) m_status->setText(tr("Rules warning: %1").arg(error));
+    m_history.open();
+    const QString serialName = QSettings().value("serial/port", QStringLiteral("/dev/ttyUSB0")).toString();
+    m_serial->setPortName(serialName);
+    m_serial->setBaudRate(QSerialPort::Baud9600);
+    m_serial->open(QIODevice::WriteOnly);
     openCamera();
     connect(&m_timer, SIGNAL(timeout()), this, SLOT(readFrame()));
     m_timer.start(50);
@@ -80,12 +89,22 @@ void AutoWindow::buildUi()
     QPushButton *calibrate = new QPushButton(tr("CALIBRATE"), buttonPanel);
     QPushButton *settings = new QPushButton(tr("SETTINGS"), buttonPanel);
     QPushButton *stop = new QPushButton(tr("STOP"), buttonPanel);
+    QPushButton *camera = new QPushButton(tr("CAMERA"), buttonPanel);
+    QPushButton *history = new QPushButton(tr("HISTORY"), buttonPanel);
+    QPushButton *print = new QPushButton(tr("PRINT"), buttonPanel);
+    QPushButton *variation = new QPushButton(tr("VARIATION"), buttonPanel);
     buttons->addWidget(background, 4, 0); buttons->addWidget(calibrate, 4, 1);
     buttons->addWidget(settings, 5, 0); buttons->addWidget(stop, 5, 1);
+    buttons->addWidget(camera, 6, 0); buttons->addWidget(history, 6, 1);
+    buttons->addWidget(print, 7, 0); buttons->addWidget(variation, 7, 1);
     connect(background, SIGNAL(clicked()), this, SLOT(captureBackground()));
     connect(calibrate, SIGNAL(clicked()), this, SLOT(chooseCalibration()));
     connect(settings, SIGNAL(clicked()), this, SLOT(openSettings()));
     connect(stop, SIGNAL(clicked()), this, SLOT(stopMeasurement()));
+    connect(camera, SIGNAL(clicked()), this, SLOT(openCameraSettings()));
+    connect(history, SIGNAL(clicked()), this, SLOT(openHistory()));
+    connect(print, SIGNAL(clicked()), this, SLOT(openPrint()));
+    connect(variation, SIGNAL(clicked()), this, SLOT(openVariation()));
 
     QHBoxLayout *body = new QHBoxLayout;
     body->addWidget(m_preview, 4);
@@ -163,12 +182,23 @@ void AutoWindow::captureBackground()
 
 void AutoWindow::performMeasurement(const cv::Mat &frame)
 {
-    const MeasurementResult result = m_engine.measure(frame, m_mode);
+    MeasurementResult result = m_engine.measure(frame, m_mode);
     if (!result.valid) return;
+    QSettings settings;
+    result.length *= 1.0 + settings.value("variation/length", 0).toDouble() / 100.0;
+    result.width *= 1.0 + settings.value("variation/width", 0).toDouble() / 100.0;
+    result.ratio = result.width > 0 ? result.length / result.width : 0;
+    result.message = tr("L %1 mm   W %2 mm   R %3").arg(result.length, 0, 'f', 2)
+        .arg(result.width, 0, 'f', 2).arg(result.ratio, 0, 'f', 2);
     const int bin = matchingBin(result);
     m_status->setText(bin > 0 ? tr("%1   → BIN %2").arg(result.message).arg(bin) :
                                 tr("%1   → NO MATCH").arg(result.message));
     m_measurementArmed = false;
+    HistoryRecord record;
+    record.measuredAt = QDateTime::currentDateTime(); record.profile = m_profile;
+    record.shape = m_mode; record.bin = bin; record.measurement = result;
+    m_history.append(record);
+    if (bin > 0 && m_serial->isOpen()) m_serial->write(QString::number(bin).toLatin1() + '\n');
 }
 
 int AutoWindow::matchingBin(const MeasurementResult &result) const
@@ -215,4 +245,33 @@ void AutoWindow::chooseCalibration()
         m_engine.setPixelsPerMillimetre(value);
         m_status->setText(tr("Calibration set to %1 px/mm").arg(value, 0, 'f', 3));
     }
+}
+
+void AutoWindow::openCameraSettings()
+{
+    CameraSettingsDialog dialog(this);
+    connect(&dialog, &CameraSettingsDialog::settingsChanged,
+            [this](double exposure, double gain, double gamma) {
+        m_camera.set(cv::CAP_PROP_EXPOSURE, exposure);
+        m_camera.set(cv::CAP_PROP_GAIN, gain);
+        m_camera.set(cv::CAP_PROP_GAMMA, gamma);
+    });
+    dialog.exec();
+}
+
+void AutoWindow::openHistory()
+{
+    HistoryDialog dialog(&m_history, this); dialog.exec();
+}
+
+void AutoWindow::openPrint()
+{
+    PrintDialog dialog(&m_rules, this); dialog.exec();
+}
+
+void AutoWindow::openVariation()
+{
+    PasswordDialog password(this);
+    if (password.exec() != QDialog::Accepted || !password.authenticated()) return;
+    VariationDialog dialog(this); dialog.exec();
 }
