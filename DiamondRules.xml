@@ -27,6 +27,7 @@
       </xs:unique>
     </xs:element>
   </xs:schema>
+  <Rule>
     <FileName>Default_Profile</FileName>
     <Number>1</Number>
     <ShapeType>Round</ShapeType>

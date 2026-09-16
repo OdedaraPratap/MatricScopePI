@@ -1,26 +1,23 @@
-﻿using uEye;
-using System;
-using System.IO;
-using System.Linq;
+﻿using MvCamCtrl.NET;
 using OpenCvSharp;
+using OpenCvSharp.Extensions;
+using OpenCvSharp.ML;
+using System;
 using System.Data;
-using uEye.Defines;
-using System.Drawing;
-using System.Xml.Linq;
-using System.IO.Ports;
-using System.Text.Json;
-using System.Threading;
 using System.Diagnostics;
-using System.Data.SQLite;
-using System.Windows.Forms;
-using System.Reflection.Emit;
+using System.Drawing;
 using System.Drawing.Imaging;
-using System.Collections.Generic;
+using System.IO;
+using System.IO.Ports;
+using System.Linq;
+using System.Reflection.Emit;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
-using MvCamCtrl.NET;
-using OpenCvSharp.ML;
-using OpenCvSharp.Extensions;
+using System.Threading;
+using System.Windows.Forms;
+using uEye;
+using uEye.Defines;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement;
 
 namespace Matric_scope
 {
@@ -32,240 +29,68 @@ namespace Matric_scope
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         public static extern bool ReleaseCapture();
 
-        public const int WM_NCLBUTTONDOWN = 0xA1, HT_CAPTION = 0x2;
-        private bool isInitializing = true;
-        private ShapeData activeCustomShape = null;
-        private CustomShapeEngine customEngine = new CustomShapeEngine();
-        enum MeasurementMode { None,Round, Pear, Oval, Heart, Marquise, Poly, General, GeneralC, Custom }
+        public const int WM_NCLBUTTONDOWN = 0xA1;
+        public const int HT_CAPTION = 0x2;
+
+        enum MeasurementMode { None, Round, Pear, Heart, Marquise, Poly,Emerald }
         MeasurementMode currentMode = MeasurementMode.None;
-        //private bool isMeasurementStopped = false;
-        public static string currentfile = "Default_Profile";
-        private readonly Dictionary<int, int> lightBlinkCounters = new Dictionary<int, int>();
-        private readonly object counterLock = new object(), frameLock = new object();
         public MyCamera.cbOutputExdelegate ImageCallback;
         Object mBufferDriverLock = new Object();
         uint m_BuffersizeForDriver = 0;
+        public MyCamera device;
+        ColorPalette cp;
+        private Mat backgroundGray = null;
+        // State management variables
+        private bool isObjectPresent = false;
+        private bool hasMeasuredCurrentObject = false;
+        // Motion and Position Tracking
+        private OpenCvSharp.Point lastCentroid = new OpenCvSharp.Point(0, 0);
+        private int stableFrameCount = 0;
+        private const int FRAMES_TO_STABILIZE = 8; // Wait for ~300ms of absolute stillness before measuring
+        private const double MOVEMENT_THRESHOLD = 9.0; // Sensitivity: how many pixels the object can shift before it's considered "moving"
+        private int thresholdValue = 25;
+        private Stopwatch stopWatch = System.Diagnostics.Stopwatch.StartNew();
+        private uEye.Camera Camera;
+        public static bool calibclick = false;
         ModifyRegistry mr = new ModifyRegistry();
         private SerialPort arduinoPort;
-        private static DataTable dtRules;
-        public MyCamera device;
-        private uEye.Camera Camera;
-        ColorPalette cp;
-        private bool isObjectPresent = false, hasMeasuredCurrentObject = false, captureFlag = false, isRenderingSnapshot = false, isSerialConnected = false;
-        private OpenCvSharp.Point lastCentroid = new OpenCvSharp.Point(0, 0);
-        private int stableFrameCount = 0, thresholdValue = 25;
-        private const int FRAMES_TO_STABILIZE = 8; 
-        private const double MOVEMENT_THRESHOLD = 9.0; 
-        private Stopwatch stopWatch = System.Diagnostics.Stopwatch.StartNew();
-        public static bool calibclick = false;
-        private Mat liveMat = new Mat(), lastProcessedFrame = new Mat(), motionAnalysisMat = new Mat(), backgroundGray = null, stableDisplayMat = new Mat();
-        private static string xmlFilePath = Path.Combine(Application.StartupPath, "DiamondRules.xml");
-        private readonly string storageFilePath = Path.Combine(Application.StartupPath, "tray_counters.json");
-        private readonly List<double> stableLengthSamples = new List<double>();
-        private readonly List<double> stableWidthSamples = new List<double>();
-        private const int REQUIRED_SMOOTHING_SAMPLES = 8; 
-        private bool isBatchProcessed = false;
-        public static bool autoPrint = false, autosave = false;
-        string targetedDevice;
-        private Camera_Setting1 camsetInstance = null;
-        private FrmCalib calibforminstance = null;
+        private bool isSerialConnected = false;
+        private Mat liveMat = new Mat();
+        private Mat lastProcessedFrame = new Mat();
+        private Mat motionAnalysisMat = new Mat();
+        private readonly object frameLock = new object();
+        private DataTable dtRules;
+        private readonly string xmlFilePath = Path.Combine(Application.StartupPath, "DiamondRules.xml");
+        bool captureFlag = false;
+        private bool isRenderingSnapshot = false;
 
-        private void SwitchMeasurementMode(MeasurementMode newMode)
-        {
-            lock (frameLock) // Protects camera loops from modifying currentMode mid-transit
-            {
-                // Scenario A: Software just started up (currentMode is None)
-                if (currentMode == MeasurementMode.None)
-                {
-                    currentMode = newMode;
-                    this.BeginInvoke((MethodInvoker)delegate { UpdateMeasurementUI($"Mode: Auto {newMode} Measurement"); });
-                    return;
-                }
-
-                // Scenario B: User clicked the EXACT SAME button again 
-                if (currentMode == newMode)
-                {
-                    return;
-                }
-
-                // Scenario C: User is changing to a completely DIFFERENT shape batch mid-session
-                if (currentMode != newMode)
-                {
-                    currentMode = newMode;
-
-                    // Clean up old sample averages instantly so the new shape engine starts clean
-                    stableLengthSamples.Clear();
-                    stableWidthSamples.Clear();
-                    stableFrameCount = 0;
-                    isBatchProcessed = false;
-                    hasMeasuredCurrentObject = false;
-                    isRenderingSnapshot = false;
-
-                    lock (counterLock)
-                    {
-                        lightBlinkCounters.Clear(); // Wipe the RAM memory map
-                        if (File.Exists(storageFilePath))
-                        {
-                            File.WriteAllText(storageFilePath, "{}"); // Empty the JSON save file on disk
-                        }
-                    }
-                    this .BeginInvoke((MethodInvoker)delegate {lblCurrentMode.Text = "Mode : "+currentMode.ToString(); });
-                    this.BeginInvoke((MethodInvoker)delegate { UpdateMeasurementUI($"Mode: Auto {newMode} Measurement. Counters Reset."); });
-                }
-            }
-        }
-
-        private void LoadCountersFromFile()
-        {
-            try
-            {
-                if (File.Exists(storageFilePath))
-                {
-                    string jsonString = File.ReadAllText(storageFilePath);
-
-                    lock (counterLock)
-                    {
-                        var loadedCounters = JsonSerializer.Deserialize<Dictionary<int, int>>(jsonString);
-
-                        if (loadedCounters != null)
-                        {
-                            lightBlinkCounters.Clear();
-                            foreach (var kvp in loadedCounters)
-                            {
-                                lightBlinkCounters[kvp.Key] = kvp.Value;
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Error loading historical sorting data: {ex.Message}", "Storage Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-        }
-
-        private void SaveCountersToFile()
-        {
-            try
-            {
-                lock (counterLock)
-                {
-                    // Convert the dictionary into a clean text string layout
-                    string jsonString = JsonSerializer.Serialize(lightBlinkCounters);
-                    File.WriteAllText(storageFilePath, jsonString);
-                }
-            }
-            catch (Exception ex)
-            {
-                // Fail-safe logging so an I/O lag doesn't freeze your measurement thread
-                System.Diagnostics.Debug.WriteLine($"Failed to save counters: {ex.Message}");
-            }
-        }
-
-        private void UpdatePictureBoxAspectRatio()
-        {
-            // Define your panel widths and top bar heights
-            int leftPanelWidth = 220;  // Matches the new Left Panel we will create
-            int rightPanelWidth = 160; // Matches your panelRightSide width
-            int topBarsHeight = 32 + 80; // Title bar (32) + FlowLayoutButtons (120)
-
-            // 1. Calculate available space between the two sidebars
-            int availableWidth = this.ClientSize.Width - leftPanelWidth - rightPanelWidth;
-            int availableHeight = this.ClientSize.Height - topBarsHeight;
-
-            if (availableWidth <= 0 || availableHeight <= 0) return;
-
-            // 2. Camera target aspect ratio (1280 / 1024 = 1.25)
-            double targetAspectRatio = 1280.0 / 1024.0;
-            int newWidth, newHeight;
-
-            // 3. Mathematical check
-            if ((double)availableWidth / availableHeight > targetAspectRatio)
-            {
-                // Screen is too wide: constrain by available height
-                newHeight = availableHeight;
-                newWidth = (int)(newHeight * targetAspectRatio);
-            }
-            else
-            {
-                // Screen is too tall: constrain by available width
-                newWidth = availableWidth;
-                newHeight = (int)(newWidth / targetAspectRatio);
-            }
-
-            // 4. Center the picture box in the remaining empty space
-            // Offset X starts AFTER the left panel
-            int offsetX = leftPanelWidth + ((availableWidth - newWidth) / 2);
-            // Offset Y starts AFTER the top buttons
-            int offsetY = topBarsHeight + ((availableHeight - newHeight) / 2);
-
-            // 5. Apply the calculated coordinates
-            this.pictureBox1.Size = new System.Drawing.Size(newWidth, newHeight);
-            this.pictureBox1.Location = new System.Drawing.Point(offsetX, offsetY);
-        }
-
-        private void PopulateCustomShapesMenu()
-        {
-            if (customShapesMenuItem == null) return;
-
-            customShapesMenuItem.DropDownItems.Clear();
-            List<ShapeData> shapes = DatabaseHelper.GetAllShapes();
-
-            if (shapes.Count == 0)
-            {
-                customShapesMenuItem.DropDownItems.Add(new ToolStripMenuItem("No Custom Shapes Saved") { Enabled = false });
-                return;
-            }
-
-            foreach (var shape in shapes)
-            {
-                var shapeItem = new ToolStripMenuItem($"{shape.Name}");
-
-                // Support both Right-Click and Normal Click
-                shapeItem.MouseDown += (s, e) =>
-                {
-                    // If user RIGHT-CLICKS a shape in the menu:
-                    if (e.Button == MouseButtons.Right)
-                    {
-                        var confirm = MessageBox.Show($"Are you sure you want to delete '{shape.Name}'?",
-                                                      "Delete Custom Shape",
-                                                      MessageBoxButtons.YesNo,
-                                                      MessageBoxIcon.Warning);
-
-                        if (confirm == DialogResult.Yes)
-                        {
-                            DatabaseHelper.DeleteShape(shape.Id);
-
-                            // Clear active shape if we deleted the current active one
-                            if (activeCustomShape != null && activeCustomShape.Id == shape.Id)
-                            {
-                                activeCustomShape = null;
-                                btnGeneralC_Click(null, null);
-                            }
-                            customShapesMenuItem.DropDown.Close();
-                            PopulateCustomShapesMenu(); // Refresh menu
-                        }
-                    }
-                    // If user LEFT-CLICKS a shape:
-                    else if (e.Button == MouseButtons.Left)
-                    {
-                        activeCustomShape = shape;
-                        currentMode = MeasurementMode.Custom;
-                        UpdateMeasurementUI($"Active Custom Shape: {shape.Name}");
-                        picPreview.Image = CreateNonIndexedImage(new Bitmap(activeCustomShape.ImagePath));
-                        //customEngine.MeasureCustomShape(BitmapConverter.ToMat(CreateNonIndexedImage(new Bitmap(@"C:\Users\Administrator\Desktop\Marquise_Result - Copy.png"))), activeCustomShape, backgroundGray);
-                    }
-                };
-
-                customShapesMenuItem.DropDownItems.Add(shapeItem);
-            }
-        }
+        private readonly Size designClientSize = new Size(1291, 1061);
+        private bool displayLayoutScaled;
 
         public FrmAuto()
         {
             InitializeComponent();
-            DatabaseHelper.InitializeDatabase();
-            PopulateCustomShapesMenu();
+            Shown += FrmAuto_Shown;
+        }
+
+        private void FrmAuto_Shown(object sender, EventArgs e)
+        {
+            ScaleLayoutToDisplay();
+        }
+
+        private void ScaleLayoutToDisplay()
+        {
+            if (displayLayoutScaled || ClientSize.Width <= 0 || ClientSize.Height <= 0)
+                return;
+
+            displayLayoutScaled = true;
+            float widthScale = (float)ClientSize.Width / designClientSize.Width;
+            float heightScale = (float)ClientSize.Height / designClientSize.Height;
+
+            SuspendLayout();
+            foreach (Control control in Controls)
+                control.Scale(new SizeF(widthScale, heightScale));
+            ResumeLayout(true);
         }
 
         private void InitializeArduinoConnection()
@@ -281,176 +106,53 @@ namespace Matric_scope
             catch (Exception ex)
             {
                 isSerialConnected = false;
-                MessageBox.Show($"Could not connect to hardware: {ex.Message}", "Hardware Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show($"Could not connect to Arduino hardware: {ex.Message}", "Hardware Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
-        public static void RefreshActiveRules(string updatedFileProfile)
+        private void LoadRulesDatabase()
         {
-            currentfile = updatedFileProfile;
-
-            // Find the open instance of the form to update its instance controls safely
-            FrmAuto activeForm = Application.OpenForms.OfType<FrmAuto>().FirstOrDefault();
-
-            if (activeForm != null)
-            {
-                try
-                {
-                    activeForm.lblFile.Text = "File: " + currentfile;
-                }
-                catch
-                {
-                    activeForm.lblFile.Text = "File: None";
-                }
-
-                // Call the instance method to reload the database
-                FrmAuto.LoadRulesDatabase();
-            }
-            else
-            {
-                MessageBox.Show("Rules File not selected or form is not open.");
-            }
-        }
-
-        public static void LoadRulesDatabase()
-        {
-            // 1. Create a temporary master table to hold everything pulled out of the XML file
-            DataTable dtMaster = new DataTable("Rule");
-            dtMaster.Columns.Add("FileName", typeof(string));
-            dtMaster.Columns.Add("Number", typeof(int));
-            dtMaster.Columns.Add("FromLength", typeof(double));
-            dtMaster.Columns.Add("ToLength", typeof(double));
-            dtMaster.Columns.Add("FromWidth", typeof(double));
-            dtMaster.Columns.Add("ToWidth", typeof(double));
-
-            if (File.Exists(xmlFilePath))
-            {
-                try
-                {
-                    dtMaster.ReadXml(xmlFilePath);
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show($"Detection Form failed to load database layout: {ex.Message}", "Data Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-            }
-
             dtRules = new DataTable("Rule");
-            dtRules.Columns.Add("FileName", typeof(string));
+
+            // Define the identical layout schema so it can read the XML perfectly
             dtRules.Columns.Add("Number", typeof(int));
+            //dtRules.Columns.Add("BoxNumber", typeof(string));
+            dtRules.Columns.Add("ShapeType", typeof(string));
             dtRules.Columns.Add("FromLength", typeof(double));
             dtRules.Columns.Add("ToLength", typeof(double));
             dtRules.Columns.Add("FromWidth", typeof(double));
             dtRules.Columns.Add("ToWidth", typeof(double));
 
-            dtRules.PrimaryKey = new DataColumn[] { dtRules.Columns["FileName"], dtRules.Columns["Number"] };
+            dtRules.PrimaryKey = new DataColumn[] { dtRules.Columns["ShapeType"], dtRules.Columns["Number"] };
 
-            if (string.IsNullOrWhiteSpace(currentfile))
+            // Read the XML file populated by your other form
+            if (File.Exists(xmlFilePath))
             {
-                currentfile = "Default_Profile";
-            }
-
-            var filteredRows = dtMaster.AsEnumerable().Where(row => row.Field<string>("FileName") == currentfile);
-
-            foreach (DataRow row in filteredRows)
-            {
-                dtRules.ImportRow(row);
-            }
-
-            for (int i = 1; i <= 20; i++)
-            {
-                object[] key = new object[] { currentfile, i };
-                if (dtRules.Rows.Find(key) == null)
+                try
                 {
-                    DataRow blankRow = dtRules.NewRow();
-                    blankRow["FileName"] = currentfile;
-                    blankRow["Number"] = i;
-                    blankRow["FromLength"] = 0.0;
-                    blankRow["ToLength"] = 0.0;
-                    blankRow["FromWidth"] = 0.0;
-                    blankRow["ToWidth"] = 0.0;
-                    dtRules.Rows.Add(blankRow);
+                    dtRules.ReadXml(xmlFilePath);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Detection Form failed to load database: {ex.Message}", "Data Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             }
         }
-        
+
         private void Form1_Load(object sender, EventArgs e)
         {
-            isInitializing = true;
-
-            /*using (CustomShapeForm form = new CustomShapeForm(BitmapConverter.ToMat(CreateNonIndexedImage(new Bitmap(@"C:\Users\Administrator\Desktop\Marquise_Result.png"))),BitmapConverter.ToMat(new Bitmap("Blank_Bg.png"))))
-            {
-                if (form.ShowDialog() == DialogResult.OK)
-                {
-                    PopulateCustomShapesMenu(); // Refresh menu with newly added shape
-                }
-            }*/
-
-            //new MeasurePearShape().MeasureShapeWithVertexAxis(BitmapConverter.ToMat(CreateNonIndexedImage(new Bitmap(@"Custom 6.74x3.75.png"))));
-            UpdatePictureBoxAspectRatio();
             InitializeArduinoConnection();
-            
-            if (mr.Read("chkPrint") != null && mr.Read("chkPrint") != "" && mr.Read("chkPrint") == "true")
-            {
-                autoPrint = true;
-            }
-            else
-            {
-                autoPrint = false;
-            }
-
-
-            if (mr.Read("chkSave") != null && mr.Read("chkSave") != "" && mr.Read("chkSave") == "true")
-            {
-                autosave = true;
-            }
-            else
-            {
-                autosave = false;
-            }
-
-
-            /*try
-            {
-                currentfile = new ModifyRegistry().Read("cmbFile").ToString();
-                lblFile.Text ="File:" +currentfile;
-            }
-            catch
-            {
-                MessageBox.Show("Rules File not selected please select rules file");
-                lblFile.Text = "File:None";
-            }*/
-
-            try
-            {
-                targetedDevice = new ModifyRegistry().Read("cmbPrinters");
-            }
-            catch
-            {
-                targetedDevice = "TSC M23";
-            }
-
-            PopulateRulesComboBox();
-
-            try
-            {
-                currentfile = new ModifyRegistry().Read("cmbFile").ToString();
-
-                if (cmbRulesFile.Items.Contains(currentfile))
-                {
-                    cmbRulesFile.SelectedItem = currentfile;
-                }
-            }
-            catch
-            {
-                currentfile = cmbRulesFile.SelectedItem?.ToString();
-            }
-
             LoadRulesDatabase();
-            LoadCountersFromFile();
-            isInitializing = false;
 
+            /*Mat pearmat = Cv2.ImRead(@"C:\Users\Administrator\source\repos\opencvsharp\bin\x64\Debug\HalfMoon.png");
+            MeasurePearShape mesure = new MeasurePearShape();
+            mesure.MeasurePearWithOpenCvSharp(pearmat, this);*/
+            //MeasureHalfMoonWithOpenCvSharp(pearmat);
+            /*Bitmap bcpy = CreateNonIndexedImage(new Bitmap(@"C:\Users\Administrator\MVS\Data\SQUAre.bmp"));
+            Mat b = BitmapConverter.ToMat(bcpy);
+            PolygonMeasurement.DetectAndMeasurePolygon(b, this);*/
+            //Bitmap bmp = new Bitmap("Image_20260526172635953.png");
+            //doMesure(bmp);
             try
             {
                 /*trackBar1.Minimum = 0;
@@ -481,59 +183,6 @@ namespace Matric_scope
             }
             //InitCameraMV();
             InitCameraUeye();
-            btnGeneralC_Click(null, null);
-        }
-
-        private void PopulateRulesComboBox()
-        {
-            string currentSelection = cmbRulesFile.SelectedItem?.ToString();
-            cmbRulesFile.Items.Clear();
-
-            string xmlFilePath = Path.Combine(Application.StartupPath, "DiamondRules.xml");
-            List<string> uniqueFiles = new List<string>();
-
-            if (File.Exists(xmlFilePath))
-            {
-                try
-                {
-                    // Load the XML file directly
-                    XDocument doc = XDocument.Load(xmlFilePath);
-
-                    // Extract all unique names from the <FileName> nodes
-                    uniqueFiles = doc.Descendants("FileName")
-                                     .Select(node => node.Value)
-                                     .Where(name => !string.IsNullOrWhiteSpace(name))
-                                     .Distinct()
-                                     .ToList();
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show("Error reading DiamondRules.xml: " + ex.Message);
-                }
-            }
-
-            // Force "Default_Profile" to always exist and be exactly at the top (Index 0)
-            if (uniqueFiles.Contains("Default_Profile"))
-            {
-                uniqueFiles.Remove("Default_Profile");
-            }
-            uniqueFiles.Insert(0, "Default_Profile");
-
-            // Add all extracted names to the ComboBox
-            foreach (string file in uniqueFiles)
-            {
-                cmbRulesFile.Items.Add(file);
-            }
-
-            // Restore the user's selection if they are just reloading, otherwise pick Default
-            if (!string.IsNullOrEmpty(currentSelection) && cmbRulesFile.Items.Contains(currentSelection))
-            {
-                cmbRulesFile.SelectedItem = currentSelection;
-            }
-            else
-            {
-                cmbRulesFile.SelectedIndex = 0;
-            }
         }
 
         /*public void InitCameraMV()
@@ -628,6 +277,449 @@ namespace Matric_scope
             }
         }
         */
+
+        private void onFrameEventcontinous(object sender, EventArgs e)
+        {
+            // Throttle frame captures to every 50ms (~20 FPS)
+            if (!stopWatch.IsRunning || stopWatch.ElapsedMilliseconds > 50)
+            {
+                stopWatch.Reset();
+
+                uEye.Camera camera = sender as uEye.Camera;
+                if (camera == null) return;
+
+                Int32 s32MemID;
+                Bitmap bmp = null;
+                camera.Memory.GetActive(out s32MemID);
+                camera.Memory.CopyToBitmap(s32MemID, out bmp);
+
+                if (bmp == null) return;
+
+                try
+                {
+                    Bitmap bcpy = CreateNonIndexedImage(bmp);
+
+                    using (Mat rawCamFrame = BitmapConverter.ToMat(bcpy))
+                    {
+                        lock (frameLock)
+                        {
+                            if (liveMat == null || liveMat.IsDisposed) liveMat = new Mat();
+                            rawCamFrame.CopyTo(liveMat);
+                        }
+                    }
+
+                    bmp.Dispose();
+                    bcpy.Dispose();
+
+                    if (calibclick)
+                    {
+                        lock (frameLock)
+                        {
+                            using (Bitmap calibBmp = BitmapConverter.ToBitmap(liveMat)) { docalib(calibBmp); }
+                        }
+                        calibclick = false;
+                    }
+
+                    // ==========================================================
+                    // PERFORMANCE ENGINE: ASYNCHRONOUS MOTION DETECTION LOOP
+                    // ==========================================================
+                    if (backgroundGray != null && currentMode != MeasurementMode.None)
+                    {
+                        Mat workingCopy = new Mat();
+                        lock (frameLock)
+                        {
+                            liveMat.CopyTo(workingCopy);
+                        }
+
+                        System.Threading.Tasks.Task.Run(() =>
+                        {
+                            try
+                            {
+                                using (workingCopy)
+                                using (Mat liveGray = new Mat())
+                                {
+                                    Cv2.CvtColor(workingCopy, liveGray, ColorConversionCodes.BGR2GRAY);
+                                    Cv2.MedianBlur(liveGray, liveGray, 7);
+
+                                    using (Mat diff = new Mat())
+                                    using (Mat thresh = new Mat())
+                                    {
+                                        Cv2.Absdiff(backgroundGray, liveGray, diff);
+                                        Cv2.Threshold(diff, thresh, thresholdValue, 255, ThresholdTypes.Binary);
+
+                                        int changedPixels = Cv2.CountNonZero(thresh);
+
+                                        if (changedPixels > 1250)
+                                        {
+                                            OpenCvSharp.Point[][] contours;
+                                            HierarchyIndex[] hierarchy;
+                                            Cv2.FindContours(thresh, out contours, out hierarchy, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+
+                                            bool validDiamondDetected = false;
+                                            OpenCvSharp.Point currentCentroid = new OpenCvSharp.Point(0, 0);
+
+                                            if (contours.Length > 0)
+                                            {
+                                                var largestContour = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
+                                                double contourArea = Cv2.ContourArea(largestContour);
+                                                Rect boundingBox = Cv2.BoundingRect(largestContour);
+                                                double aspect = (double)boundingBox.Width / boundingBox.Height;
+
+                                                // TWEEZER SHIELD FILTER
+                                                if (aspect > 0.22 && aspect < 4.5 && contourArea > 800)
+                                                {
+                                                    validDiamondDetected = true;
+                                                    Moments mu = Cv2.Moments(largestContour, binaryImage: true);
+                                                    if (mu.M00 > 0)
+                                                    {
+                                                        int cX = (int)(mu.M10 / mu.M00);
+                                                        int cY = (int)(mu.M01 / mu.M00);
+                                                        currentCentroid = new OpenCvSharp.Point(cX, cY);
+                                                    }
+                                                }
+                                            }
+
+                                            if (validDiamondDetected)
+                                            {
+                                                isObjectPresent = true;
+
+                                                double distanceMoved = Math.Sqrt(Math.Pow(currentCentroid.X - lastCentroid.X, 2) + Math.Pow(currentCentroid.Y - lastCentroid.Y, 2));
+
+                                                if (distanceMoved > MOVEMENT_THRESHOLD)
+                                                {
+                                                    hasMeasuredCurrentObject = false;
+                                                    stableFrameCount = 0;
+                                                    this.BeginInvoke((MethodInvoker)delegate { label1.Text = "Object moving..."; });
+                                                }
+                                                else
+                                                {
+                                                    // Object is resting in place
+                                                    if (!hasMeasuredCurrentObject)
+                                                    {
+                                                        stableFrameCount++;
+                                                        if (stableFrameCount >= FRAMES_TO_STABILIZE)
+                                                        {
+                                                            hasMeasuredCurrentObject = true;
+
+                                                            // Trigger measurement and Arduino routines once
+                                                            this.BeginInvoke((MethodInvoker)delegate
+                                                            {
+                                                                lock (frameLock)
+                                                                {
+                                                                    if (liveMat != null && !liveMat.IsDisposed && !liveMat.Empty())
+                                                                    {
+                                                                        TriggerAutoMeasurement(liveMat);
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                                lastCentroid = currentCentroid;
+                                            }
+                                            else
+                                            {
+                                                ResetTrackingState();
+                                            }
+                                        }
+                                        else
+                                        {
+                                            ResetTrackingState();
+                                        }
+                                    }
+                                }
+                            }
+                            catch (Exception) { }
+                        });
+                    }
+
+                    // ==========================================================
+                    // UNIFIED DISPLAY RENDERING PIPELINE (CONTINUOUS LIVE FEED)
+                    // ==========================================================
+                    this.BeginInvoke((MethodInvoker)delegate
+                    {
+                        try
+                        {
+                            if (pictureBox1.Image != null) pictureBox1.Image.Dispose();
+
+                            lock (frameLock)
+                            {
+                                if (liveMat != null && !liveMat.IsDisposed && !liveMat.Empty())
+                                {
+                                    // If the object is fully stable and measured, continuously re-draw
+                                    // the overlays onto the live frames so the video never freezes
+                                    if (isObjectPresent && hasMeasuredCurrentObject)
+                                    {
+                                        TriggerAutoMeasurement(liveMat);
+                                    }
+
+                                    pictureBox1.Image = BitmapConverter.ToBitmap(liveMat);
+                                }
+                            }
+                        }
+                        catch (ObjectDisposedException) { }
+                    });
+                }
+                catch (Exception) { }
+            }
+        }
+
+        private void onFrameEventWorking(object sender, EventArgs e)
+        {
+            // Throttle frame captures to every 50ms (~20 FPS)
+            if (!stopWatch.IsRunning || stopWatch.ElapsedMilliseconds > 50)
+            {
+                stopWatch.Reset();
+
+                uEye.Camera camera = sender as uEye.Camera;
+                if (camera == null) return;
+
+                Int32 s32MemID;
+                Bitmap bmp = null;
+                camera.Memory.GetActive(out s32MemID);
+                camera.Memory.CopyToBitmap(s32MemID, out bmp);
+
+                if (bmp == null) return;
+                try
+                {
+                    Bitmap bcpy = CreateNonIndexedImage(bmp);
+
+                    // Safe scoping layout: automatically disposes temporary Mat reference wrapper
+                    using (Mat rawCamFrame = BitmapConverter.ToMat(bcpy))
+                    {
+                        // Synchronize frame modification securely using the lock token
+                        lock (frameLock)
+                        {
+                            if (liveMat == null || liveMat.IsDisposed) liveMat = new Mat();
+                            rawCamFrame.CopyTo(liveMat);
+                        }
+                    }
+
+                    // Explicitly clean up unmanaged bitmap handles to prevent RAM leaks
+                    bmp.Dispose();
+                    bcpy.Dispose();
+
+                    if (calibclick)
+                    {
+                        lock (frameLock)
+                        {
+                            using (Bitmap calibBmp = BitmapConverter.ToBitmap(liveMat)) { docalib(calibBmp); }
+                        }
+                        calibclick = false;
+                    }
+
+                    // ==========================================================
+                    // PERFORMANCE ENGINE: ASYNCHRONOUS MOTION DETECTION LOOP
+                    // ==========================================================
+                    if (backgroundGray != null && currentMode != MeasurementMode.None)
+                    {
+                        // Create an isolated matrix clone for background calculations to prevent frame lag
+                        Mat workingCopy = new Mat();
+                        lock (frameLock)
+                        {
+                            liveMat.CopyTo(workingCopy);
+                        }
+
+                        System.Threading.Tasks.Task.Run(() =>
+                        {
+                            try
+                            {
+                                using (workingCopy)
+                                using (Mat liveGray = new Mat())
+                                {
+                                    Cv2.CvtColor(workingCopy, liveGray, ColorConversionCodes.BGR2GRAY);
+                                    Cv2.MedianBlur(liveGray, liveGray, 7);
+
+                                    using (Mat diff = new Mat())
+                                    using (Mat thresh = new Mat())
+                                    {
+                                        Cv2.Absdiff(backgroundGray, liveGray, diff);
+                                        Cv2.Threshold(diff, thresh, thresholdValue, 255, ThresholdTypes.Binary);
+
+                                        int changedPixels = Cv2.CountNonZero(thresh);
+
+                                        // Scenario A: An object footprint is detected on the platform stage area
+                                        if (changedPixels > 1250)
+                                        {
+                                            OpenCvSharp.Point[][] contours;
+                                            HierarchyIndex[] hierarchy;
+                                            Cv2.FindContours(thresh, out contours, out hierarchy, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+
+                                            bool validDiamondDetected = false;
+                                            OpenCvSharp.Point currentCentroid = new OpenCvSharp.Point(0, 0);
+
+                                            if (contours.Length > 0)
+                                            {
+                                                // Isolate the single largest silhouette contour on stage
+                                                var largestContour = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
+                                                double contourArea = Cv2.ContourArea(largestContour);
+                                                Rect boundingBox = Cv2.BoundingRect(largestContour);
+
+                                                // Calculate Aspect Ratio (Width / Height balance ratio)
+                                                double aspect = (double)boundingBox.Width / boundingBox.Height;
+
+                                                // ==========================================================
+                                                // TWEEZER SHIELD EXCLUSION FILTERS
+                                                // ==========================================================
+                                                // Tweezers are thin/stretched (unbalanced aspect ratio) and produce low density masks
+                                                if (aspect > 0.22 && aspect < 4.5 && contourArea > 800)
+                                                {
+                                                    validDiamondDetected = true;
+                                                    Moments mu = Cv2.Moments(largestContour, binaryImage: true);
+                                                    if (mu.M00 > 0)
+                                                    {
+                                                        int cX = (int)(mu.M10 / mu.M00);
+                                                        int cY = (int)(mu.M01 / mu.M00);
+                                                        currentCentroid = new OpenCvSharp.Point(cX, cY);
+                                                    }
+                                                }
+                                            }
+
+                                            if (validDiamondDetected)
+                                            {
+                                                isObjectPresent = true;
+
+                                                // Check structural movement delta distance since last frame loop cycle
+                                                double distanceMoved = Math.Sqrt(Math.Pow(currentCentroid.X - lastCentroid.X, 2) + Math.Pow(currentCentroid.Y - lastCentroid.Y, 2));
+
+                                                if (distanceMoved > MOVEMENT_THRESHOLD)
+                                                {
+                                                    hasMeasuredCurrentObject = false;
+                                                    stableFrameCount = 0;
+                                                    this.BeginInvoke((MethodInvoker)delegate { label1.Text = "Object moving..."; });
+                                                }
+                                                else
+                                                {
+                                                    // Object is sitting completely resting in place
+                                                    if (!hasMeasuredCurrentObject)
+                                                    {
+                                                        stableFrameCount++;
+                                                        if (stableFrameCount >= FRAMES_TO_STABILIZE)
+                                                        {
+                                                            hasMeasuredCurrentObject = true;
+
+                                                            // FIX: Move measurement and snapshot processing directly to the UI thread
+                                                            // to guarantee zero memory access crashes on lastProcessedFrame!
+                                                            this.BeginInvoke((MethodInvoker)delegate
+                                                            {
+                                                                lock (frameLock)
+                                                                {
+                                                                    if (liveMat != null && !liveMat.IsDisposed && !liveMat.Empty())
+                                                                    {
+                                                                        // 1. Run the shape measurement and draw vectors/lines
+                                                                        TriggerAutoMeasurement(liveMat);
+
+                                                                        // 2. Lock freeze snapshot immediately on the same execution thread
+                                                                        if (lastProcessedFrame == null || lastProcessedFrame.IsDisposed)
+                                                                            lastProcessedFrame = new Mat();
+
+                                                                        liveMat.CopyTo(lastProcessedFrame);
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                                lastCentroid = currentCentroid;
+                                            }
+                                            else
+                                            {
+                                                // Something is on stage but it failed the diamond dimensional criteria (tweezers!)
+                                                ResetTrackingState();
+                                            }
+                                        }
+                                        // Scenario B: Stage is completely clear / empty space
+                                        else
+                                        {
+                                            ResetTrackingState();
+                                        }
+                                    }
+                                }
+                            }
+                            catch (Exception) { }
+                        });
+                    }
+
+                    // ==========================================================
+                    // UNIFIED DISPLAY RENDERING PIPELINE (STABLE UI RUNTIME)
+                    // ==========================================================
+                    /*this.BeginInvoke((MethodInvoker)delegate
+                    {
+                        try
+                        {
+                            if (pictureBox1.Image != null) pictureBox1.Image.Dispose();
+
+                            lock (frameLock)
+                            {
+                                // Render the locked processed snapshot matrix canvas if the stone is measured
+                                if (isObjectPresent && hasMeasuredCurrentObject && lastProcessedFrame != null && !lastProcessedFrame.IsDisposed && !lastProcessedFrame.Empty())
+                                {
+                                    pictureBox1.Image = BitmapConverter.ToBitmap(lastProcessedFrame);
+                                }
+                                else
+                                {
+                                    // Otherwise, pass through the raw streaming camera live views feed
+                                    if (liveMat != null && !liveMat.IsDisposed && !liveMat.Empty())
+                                    {
+                                        pictureBox1.Image = BitmapConverter.ToBitmap(liveMat);
+                                    }
+                                }
+                            }
+                        }
+                        catch (ObjectDisposedException) { }
+                    });*/
+                    Bitmap bitmapToRender = null;
+
+                    lock (frameLock)
+                    {
+                        try
+                        {
+                            // 1. If the stone is measured, snapshot the processed canvas
+                            if (isObjectPresent && hasMeasuredCurrentObject && lastProcessedFrame != null && !lastProcessedFrame.IsDisposed && !lastProcessedFrame.Empty())
+                            {
+                                bitmapToRender = BitmapConverter.ToBitmap(lastProcessedFrame);
+                            }
+                            // 2. Otherwise, pass through the raw streaming camera live view
+                            else if (liveMat != null && !liveMat.IsDisposed && !liveMat.Empty())
+                            {
+                                bitmapToRender = BitmapConverter.ToBitmap(liveMat);
+                            }
+                        }
+                        catch (Exception)
+                        {
+                            // Safe fallback if memory was busy
+                            bitmapToRender = null;
+                        }
+                    }
+
+                    // 3. Send the pre-converted, safe .NET Bitmap directly to the UI thread
+                    if (bitmapToRender != null)
+                    {
+                        this.BeginInvoke((MethodInvoker)delegate
+                        {
+                            try
+                            {
+                                // Clean up the old picturebox image to prevent memory leaks
+                                if (pictureBox1.Image != null)
+                                {
+                                    pictureBox1.Image.Dispose();
+                                }
+
+                                // Assign the new bitmap instantly without needing ANY locks here
+                                pictureBox1.Image = bitmapToRender;
+                            }
+                            catch (ObjectDisposedException) { }
+                            catch (Exception)
+                            {
+                                // If anything goes wrong, dispose the dangling bitmap allocation
+                                bitmapToRender.Dispose();
+                            }
+                        });
+                    }
+                }
+                catch (Exception) { }
+            }
+        }
 
         private void onFrameEvent(object sender, EventArgs e)
         {
@@ -753,7 +845,7 @@ namespace Matric_scope
                                                 if (distanceMoved > MOVEMENT_THRESHOLD)
                                                 {
                                                     ResetSnapshotState();
-                                                    this.BeginInvoke((MethodInvoker)delegate { UpdateMeasurementUI("Object moving..."); });
+                                                    this.BeginInvoke((MethodInvoker)delegate { label1.Text = "Object moving..."; });
                                                 }
                                                 else
                                                 {
@@ -839,7 +931,7 @@ namespace Matric_scope
             isRenderingSnapshot = false; // Instantly switches UI back to the live camera feed
             lastCentroid = new OpenCvSharp.Point(0, 0);
 
-            this.BeginInvoke((MethodInvoker)delegate { UpdateMeasurementUI("Waiting for object..."); });
+            this.BeginInvoke((MethodInvoker)delegate { label1.Text = "Waiting for object..."; });
         }
 
         private void ResetTrackingState()
@@ -856,7 +948,7 @@ namespace Matric_scope
                     lastProcessedFrame.SetTo(new Scalar(0)); // Reset frame buffer to pure black securely
                 }
             }
-            this.BeginInvoke((MethodInvoker)delegate { UpdateMeasurementUI("Waiting for object..."); });
+            this.BeginInvoke((MethodInvoker)delegate { label1.Text = "Waiting for object..."; });
         }
 
         /*void ImageCallBackFunc(IntPtr pData, ref MyCamera.MV_FRAME_OUT_INFO_EX pFrameInfo, IntPtr pUser)
@@ -979,12 +1071,12 @@ namespace Matric_scope
                 stopWatch.Restart();
             }
         }*/
-        
+
         private void InitCameraUeye()
         {
             Camera = new uEye.Camera();
             uEye.Defines.Status statusRet = 0;
-            
+            // Open Camera
             statusRet = Camera.Init();
             if (statusRet != uEye.Defines.Status.SUCCESS)
             {
@@ -998,7 +1090,7 @@ namespace Matric_scope
                 MessageBox.Show("Allocate Memory failed");
             }
             // Start Live Video
-            statusRet = Camera.Acquisition.Capture();
+            statusRet = Camera.Acquisition.Capture(DeviceParameter.Wait);
             Camera.Parameter.Load("cam.ini");
             //Int32 s32Value = Convert.ToInt32(mr.Read("trackBarGainMaster1"));
             //Camera.Gain.Hardware.Scaled.SetMaster(s32Value);
@@ -1012,6 +1104,8 @@ namespace Matric_scope
             }
             Camera.EventFrame += onFrameEvent;
             Camera.Gain.Hardware.Scaled.SetMaster(Convert.ToInt32(mr.Read("trackBarGainMaster1")));
+            uEye.Defines.Status statusRet1;
+            uEye.Types.Range<Double> range1;
             statusRet = Camera.Timing.Exposure.GetRange(out range);
             Double dValue1 = range.Minimum + Convert.ToInt32(mr.Read("trackBarExposure1")) * range.Increment;
             statusRet = Camera.Timing.Exposure.Set(dValue1);
@@ -1024,6 +1118,181 @@ namespace Matric_scope
                 Camera.Gamma.Software.Set(Convert.ToInt32(mr.Read("trackBarGamma")));
             }
         }
+
+        /*private void onFrameEventOLDWithoutDrawing(object sender, EventArgs e)
+        {
+            // Throttle frame captures to every 50ms (~20 FPS)
+            if (!stopWatch.IsRunning || stopWatch.ElapsedMilliseconds > 50)
+            {
+                stopWatch.Reset();
+
+                uEye.Camera camera = sender as uEye.Camera;
+                if (camera == null) return;
+
+                Int32 s32MemID;
+                Bitmap bmp = null;
+                camera.Memory.GetActive(out s32MemID);
+                camera.Memory.CopyToBitmap(s32MemID, out bmp);
+
+                if (bmp == null) return;
+
+                try
+                {
+                    Bitmap bcpy = CreateNonIndexedImage(bmp);
+
+                    // Safe scoping layout: automatically disposes temporary Mat reference wrapper
+                    using (Mat rawCamFrame = BitmapConverter.ToMat(bcpy))
+                    {
+                        // Synchronize frame modification securely using the lock token
+                        lock (frameLock)
+                        {
+                            if (liveMat == null || liveMat.IsDisposed) liveMat = new Mat();
+                            rawCamFrame.CopyTo(liveMat);
+                        }
+                    }
+
+                    // Explicitly clean up unmanaged bitmap handles to prevent RAM leaks
+                    bmp.Dispose();
+                    bcpy.Dispose();
+
+                    if (calibclick)
+                    {
+                        lock (frameLock)
+                        {
+                            using (Bitmap calibBmp = BitmapConverter.ToBitmap(liveMat)) { docalib(calibBmp); }
+                        }
+                        calibclick = false;
+                    }
+
+                    // ---- AUTO DETECTION & MOTION LOGIC ----
+                    if (backgroundGray != null && currentMode != MeasurementMode.None)
+                    {
+                        using (Mat liveGray = new Mat())
+                        {
+                            lock (frameLock)
+                            {
+                                Cv2.CvtColor(liveMat, liveGray, ColorConversionCodes.BGR2GRAY);
+                            }
+                            Cv2.MedianBlur(liveGray, liveGray, 7);
+
+                            using (Mat diff = new Mat())
+                            using (Mat thresh = new Mat())
+                            {
+                                Cv2.Absdiff(backgroundGray, liveGray, diff);
+                                Cv2.Threshold(diff, thresh, thresholdValue, 255, ThresholdTypes.Binary);
+
+                                int changedPixels = Cv2.CountNonZero(thresh);
+
+                                // Scenario A: An object is present on the stage
+                                if (changedPixels > 1250)
+                                {
+                                    isObjectPresent = true;
+
+                                    Moments mu = Cv2.Moments(thresh, binaryImage: true);
+                                    if (mu.M00 > 0)
+                                    {
+                                        int cX = (int)(mu.M10 / mu.M00);
+                                        int cY = (int)(mu.M01 / mu.M00);
+                                        OpenCvSharp.Point currentCentroid = new OpenCvSharp.Point(cX, cY);
+
+                                        double distanceMoved = Math.Sqrt(Math.Pow(currentCentroid.X - lastCentroid.X, 2) +
+                                                                         Math.Pow(currentCentroid.Y - lastCentroid.Y, 2));
+
+                                        if (distanceMoved > MOVEMENT_THRESHOLD)
+                                        {
+                                            // Object is moving! Reset tracking states
+                                            hasMeasuredCurrentObject = false;
+                                            stableFrameCount = 0;
+
+                                            this.BeginInvoke((MethodInvoker)delegate { label1.Text = "Object moving..."; });
+                                        }
+                                        else
+                                        {
+                                            // Object is completely resting in place
+                                            if (!hasMeasuredCurrentObject)
+                                            {
+                                                stableFrameCount++;
+                                                if (stableFrameCount >= FRAMES_TO_STABILIZE)
+                                                {
+                                                    hasMeasuredCurrentObject = true;
+
+                                                    // 1. Run measurement logic synchronously (draws shapes straight onto liveMat)
+                                                    TriggerAutoMeasurement(liveMat);
+
+
+
+
+                                                    // 2. LOCK SNAPSHOT: Safely copy the annotated live matrix into the persistent display memory
+                                                    lock (frameLock)
+                                                    {
+                                                        if (lastProcessedFrame == null || lastProcessedFrame.IsDisposed)
+                                                            lastProcessedFrame = new Mat();
+
+                                                        liveMat.CopyTo(lastProcessedFrame);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        lastCentroid = currentCentroid;
+                                    }
+                                }
+                                // Scenario B: Stage is completely cleared / object removed
+                                else
+                                {
+                                    stableFrameCount = 0;
+                                    isObjectPresent = false;
+                                    hasMeasuredCurrentObject = false;
+                                    lastCentroid = new OpenCvSharp.Point(0, 0);
+
+                                    // FIX: Blank out the matrix state memory safely without invoking crash-prone .Release() disposals
+                                    lock (frameLock)
+                                    {
+                                        if (lastProcessedFrame != null && !lastProcessedFrame.IsDisposed && !lastProcessedFrame.Empty())
+                                        {
+                                            lastProcessedFrame.SetTo(new Scalar(0));
+                                        }
+                                    }
+
+                                    this.BeginInvoke((MethodInvoker)delegate { label1.Text = "Waiting for object..."; });
+                                }
+                            }
+                        }
+                    }
+                    // ==========================================================
+                    // UNIFIED DISPLAY RENDERING PIPELINE (THREAD-SAFE FIXED)
+                    // ==========================================================
+                    this.BeginInvoke((MethodInvoker)delegate
+                    {
+                        try
+                        {
+                            if (pictureBox1.Image != null) pictureBox1.Image.Dispose();
+
+                            // Lock the evaluation process completely so the tracking blocks can't touch memory structures simultaneously
+                            lock (frameLock)
+                            {
+                                if (isObjectPresent && hasMeasuredCurrentObject && lastProcessedFrame != null && !lastProcessedFrame.IsDisposed && !lastProcessedFrame.Empty())
+                                {
+                                    pictureBox1.Image = BitmapConverter.ToBitmap(lastProcessedFrame);
+                                }
+                                else
+                                {
+                                    if (liveMat != null && !liveMat.IsDisposed && !liveMat.Empty())
+                                    {
+                                        pictureBox1.Image = BitmapConverter.ToBitmap(liveMat);
+                                    }
+                                }
+                            }
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            // Fail-safe protection layer for clean application teardowns
+                        }
+                    });
+                }
+                catch (Exception) { }
+            }
+        }
+        */
 
         public Bitmap CreateNonIndexedImage(Bitmap src)
         {
@@ -1047,14 +1316,13 @@ namespace Matric_scope
                 switch (currentMode)
                 {
                     case MeasurementMode.Round:
-                        //this.Invoke((MethodInvoker)delegate { doMesure(frame); });
-                        cvDisplayString = doMesure(frame);
+                        // If doMesure updates labels natively, you should ideally modify it to return a string.
+                        // For now, if forced onto the UI thread, wrap it minimally:
+                        this.Invoke((MethodInvoker)delegate { doMesure(frame); cvDisplayString = label1.Text; });
                         break;
+
                     case MeasurementMode.Pear:
                         cvDisplayString = new MeasurePearShape().MeasurePearWithOpenCvSharp(frame);
-                        break;
-                    case MeasurementMode.Oval:
-                        cvDisplayString = new MeasurePearShape().MeasureOvelWithOpenCvSharp(frame);
                         break;
                     case MeasurementMode.Heart:
                         cvDisplayString = new MeasurePearShape().MeasureHeartWithOpenCvSharp(frame);
@@ -1065,20 +1333,15 @@ namespace Matric_scope
                     case MeasurementMode.Poly:
                         cvDisplayString = PolygonMeasurement.DetectAndMeasurePolygon(frame);
                         break;
-                    case MeasurementMode.General:
+                    case MeasurementMode.Emerald:
                         cvDisplayString = new MeasurePearShape().MeasurePearWithOpenCvSharp1(frame);
                         break;
-                    case MeasurementMode.GeneralC:
-                        cvDisplayString = new MeasurePearShape().MeasureShapeWithVertexAxis(frame);
-                        break;
-                    case MeasurementMode.Custom:
-                        cvDisplayString = customEngine.MeasureCustomShape(frame, activeCustomShape, backgroundGray);
-                        break;
                 }
+
+                // Safely dispatch calculated text results back to UI
                 this.BeginInvoke((MethodInvoker)delegate
                 {
-                    if (!string.IsNullOrEmpty(cvDisplayString))
-                        UpdateMeasurementUI(cvDisplayString);
+                    if (!string.IsNullOrEmpty(cvDisplayString)) label1.Text = cvDisplayString;
                 });
 
                 if (string.IsNullOrEmpty(cvDisplayString) || cvDisplayString.Contains("Error") || cvDisplayString.Contains("Please Calibrate") || cvDisplayString.ToLower().Contains("object"))
@@ -1125,9 +1388,9 @@ namespace Matric_scope
                 DataRow matchedSortingRule = null;
                 string currentShapeNameString = currentMode.ToString();
 
-                if (dtRules != null)
+                foreach (DataRow row in dtRules.Rows)
                 {
-                    foreach (DataRow row in dtRules.Rows)
+                    if (row["ShapeType"].ToString() == currentShapeNameString)
                     {
                         double fromLen = Convert.ToDouble(row["FromLength"]);
                         double toLen = Convert.ToDouble(row["ToLength"]);
@@ -1136,7 +1399,6 @@ namespace Matric_scope
 
                         if (currentMode == MeasurementMode.Round)
                         {
-                            // Round shape: Consider FromLength and ToLength only
                             if (extractedLength >= fromLen && extractedLength <= toLen)
                             {
                                 matchedSortingRule = row;
@@ -1145,7 +1407,6 @@ namespace Matric_scope
                         }
                         else
                         {
-                            // All other shapes: Consider all 4 parameters (Length + Width ranges)
                             if (extractedLength >= fromLen && extractedLength <= toLen && extractedWidth >= fromWid && extractedWidth <= toWid)
                             {
                                 matchedSortingRule = row;
@@ -1162,112 +1423,202 @@ namespace Matric_scope
                 {
                     int targetSquareNumber = Convert.ToInt32(matchedSortingRule["Number"]);
 
-                    // --- INCREMENT COUNTER ---
-                    lock (counterLock)
-                    {
-                        if (lightBlinkCounters.ContainsKey(targetSquareNumber))
-                        {
-                            lightBlinkCounters[targetSquareNumber]++;
-                        }
-                        else
-                        {
-                            lightBlinkCounters[targetSquareNumber] = 1;
-                        }
-                        SaveCountersToFile();
-                    }
-
                     if (isSerialConnected && arduinoPort != null && arduinoPort.IsOpen)
                     {
-                        arduinoPort.WriteLine(targetSquareNumber.ToString() + "\n");
+                        // FIX: WriteLine adds a standard '\n' termination char so Arduino knows when transmission ends
+                        arduinoPort.WriteLine(targetSquareNumber.ToString()+"\n");
                     }
-                }
-
-                // ==========================================
-                // 5. AUTOMATED DATA LOGGING ENGINE (WITH DRAWINGS)
-                // ==========================================
-                if (autosave)
-                {
-                    try
-                    {
-                        string recordsFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "CapturedGemstones");
-                        if (!Directory.Exists(recordsFolder))
-                        {
-                            Directory.CreateDirectory(recordsFolder);
-                        }
-
-                        string fileName = $"Gem_{DateTime.Now:yyyyMMdd_HHmmssfff}.png";
-                        string fullImagePath = Path.Combine(recordsFolder, fileName);
-
-                        OpenCvSharp.Cv2.ImWrite(fullImagePath, frame);
-
-                        string dbConnectionString = "Data Source=History.db";
-
-                        using (var connection = new SQLiteConnection(dbConnectionString))
-                        {
-                            connection.Open();
-                            string insertSql = @"INSERT INTO Records (Date, Shape, Image, Length, Width) VALUES (@date, @shape, @image, @length, @width);";
-
-                            using (var command = new SQLiteCommand(insertSql, connection))
-                            {
-                                command.Parameters.AddWithValue("@date", DateTime.Now.ToString("yyyy-MM-dd"));
-                                command.Parameters.AddWithValue("@shape", currentShapeNameString);
-                                command.Parameters.AddWithValue("@image", fullImagePath);
-                                command.Parameters.AddWithValue("@length", extractedLength);
-                                command.Parameters.AddWithValue("@width", extractedWidth);
-
-                                command.ExecuteNonQuery();
-                            }
-                        }
-                    }
-                    catch (Exception dbEx)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"Autosave write error: {dbEx.Message}");
-                    }
-                }
-
-                if (autoPrint)
-                {
-                    string printData = "";
-
-                    // Check if the UI is currently displaying a Diameter or standard Length/Width
-                    if (lblLengthTitle.Text.ToLower() == "diameter")
-                    {
-                        printData = $"Diameter: {lblLengthVal.Text} mm";
-                    }
-                    else
-                    {
-                        // Build the 3-line string exactly as it used to be
-                        printData = $"Length: {lblLengthVal.Text} mm\n" +
-                                    $"Width: {lblWidthVal.Text} mm\n" +
-                                    $"Ratio: {lblRatioVal.Text}";
-                    }
-
-                    // Pass the reconstructed string to your printing engine
-                    //engine.PrintSingleDiamond(printData, targetedDevice);
-
-                    LabelPrintingEngine engine = new LabelPrintingEngine();
-                    engine.PrintSingleDiamond(printData, targetedDevice);
                 }
             }
-            catch (Exception except) { }
+            catch (Exception) { }
         }
 
-        private void ProcessFinalAveragedMeasurement(double cleanLength, double cleanWidth)
+        private void TriggerAutoMeasurement1(Mat frame)
+        {
+            switch (currentMode)
+            {
+                case MeasurementMode.Round:
+                    // Converts frame to bitmap internally inside your method
+                    //using (Bitmap bmpConversion = BitmapConverter.ToBitmap(frame))
+                    {
+                        doMesure(frame);
+                    }
+                    break;
+
+                case MeasurementMode.Pear:
+                    string pearmesure = new MeasurePearShape().MeasurePearWithOpenCvSharp(frame);
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        label1.Text = pearmesure;
+                    });
+                    break;
+
+                case MeasurementMode.Heart:
+                    string heart = new MeasurePearShape().MeasureHeartWithOpenCvSharp(frame);
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        label1.Text = heart;
+                    });
+                    break;
+
+                case MeasurementMode.Marquise:
+                    string marq = new MeasurePearShape().MeasureMarkWithOpenCvSharp(frame);
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        label1.Text = marq;
+                    });
+                    break;
+
+                case MeasurementMode.Poly:
+
+                    string polyMesure = PolygonMeasurement.DetectAndMeasurePolygon(frame);
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        label1.Text = polyMesure;
+                    });
+                    break;
+                case MeasurementMode.Emerald:
+                    string emmesure = new MeasurePearShape().MeasurePearWithOpenCvSharp1(frame);
+                    this.Invoke((MethodInvoker)delegate
+                    {
+                        label1.Text = emmesure;
+                    });
+                    break;
+                    /*case MeasurementMode.HM:
+
+                        string hmMesure = MeasureHalfMoonWithOpenCvSharp(frame);
+                        this.Invoke((MethodInvoker)delegate
+                        {
+                            label1.Text = hmMesure;
+                        });
+                        break;*/
+            }
+        }
+
+        private void TriggerAutoMeasurementarduino(Mat frame)
         {
             try
             {
-                // Update user interface with perfectly smoothed data metrics
-                if (currentMode == MeasurementMode.Round)
-                    UpdateMeasurementUI($"Diameter : {cleanLength:F2} mm");
-                else
-                    UpdateMeasurementUI($"Length : {cleanLength:F2} mm\nWidth : {cleanWidth:F2} mm");
+                string cvDisplayString = "";
 
-                // Match against database rules parameters
+                // ==========================================
+                // 1. RUN YOUR EXISTING DETECTION METHODS
+                // ==========================================
+                switch (currentMode)
+                {
+                    case MeasurementMode.Round:
+                        //using (Bitmap bmpConversion = BitmapConverter.ToBitmap(frame))
+                        {
+                            doMesure(frame);
+                        }
+                        // Since doMesure assigns text directly to label1, we read it back
+                        this.Invoke((MethodInvoker)delegate
+                        {
+                            cvDisplayString = label1.Text;
+                        });
+                        break;
+
+                    case MeasurementMode.Pear:
+                        cvDisplayString = new MeasurePearShape().MeasurePearWithOpenCvSharp(frame);
+                        this.Invoke((MethodInvoker)delegate
+                        {
+                            label1.Text = cvDisplayString;
+                        });
+                        break;
+                    case MeasurementMode.Heart:
+                        cvDisplayString = new MeasurePearShape().MeasureHeartWithOpenCvSharp(frame);
+                        this.Invoke((MethodInvoker)delegate
+                        {
+                            label1.Text = cvDisplayString;
+                        });
+                        break;
+
+                    case MeasurementMode.Marquise:
+                        cvDisplayString = new MeasurePearShape().MeasureMarkWithOpenCvSharp(frame);
+                        this.Invoke((MethodInvoker)delegate
+                        {
+                            label1.Text = cvDisplayString;
+                        });
+                        break;
+                    case MeasurementMode.Poly:
+                        cvDisplayString = PolygonMeasurement.DetectAndMeasurePolygon(frame);
+                        this.Invoke((MethodInvoker)delegate
+                        {
+                            label1.Text = cvDisplayString;
+                        });
+                        break;
+                    case MeasurementMode.Emerald:
+                        cvDisplayString = new MeasurePearShape().MeasurePearWithOpenCvSharp1(frame);
+                        this.Invoke((MethodInvoker)delegate
+                        {
+                            label1.Text = cvDisplayString;
+                        });
+                        break;
+
+                        /*case MeasurementMode.HM:
+                            cvDisplayString = MeasureHalfMoonWithOpenCvSharp(frame);
+                            this.Invoke((MethodInvoker)delegate
+                            {
+                                label1.Text = hmMesure;
+                            });
+                            break;*/
+                }
+
+                // Integrity Check: Stop if the string is empty or contains calibration warnings
+                if (string.IsNullOrEmpty(cvDisplayString) ||
+                    cvDisplayString.Contains("Error") ||
+                    cvDisplayString.Contains("Please Calibrate")|| cvDisplayString.ToLower().Contains("object")) return;
+
+                double extractedLength = 0.0;
+                double extractedWidth = 0.0;
+
+                // ==========================================
+                // 2. CENTRAL STRING DECODER ENGINE
+                // ==========================================
+                if (currentMode == MeasurementMode.Round)
+                {
+                    // Decodes standard format: "Diameter : 4.970 mm"
+                    string[] parts = cvDisplayString.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length >= 3)
+                    {
+                        double.TryParse(parts[2], out extractedLength);
+                    }
+                }
+                else if (cvDisplayString.Contains("Side"))
+                {
+                    // Decodes Poly: Find all side measurements and isolate the longest (Length) and shortest (Width)
+                    MatchCollection sideMatches = Regex.Matches(cvDisplayString, @"Side\s+\d+:\s+([0-9]+(?:\.[0-9]+)?)");
+                    double maxSide = 0.0;
+                    double minSide = double.MaxValue;
+
+                    foreach (Match match in sideMatches)
+                    {
+                        if (match.Groups.Count > 1 && double.TryParse(match.Groups[1].Value, out double currentSideValue))
+                        {
+                            if (currentSideValue > maxSide) maxSide = currentSideValue;
+                            if (currentSideValue < minSide) minSide = currentSideValue;
+                        }
+                    }
+                    extractedLength = maxSide;
+                    extractedWidth = (minSide == double.MaxValue) ? 0.0 : minSide;
+                }
+                else
+                {
+                    // Decodes Pear / HalfMoon multi-line standard formats: Extracts numbers sequentially
+                    MatchCollection numbers = Regex.Matches(cvDisplayString, @"[0-9]+(?:\.[0-9]+)?");
+                    if (numbers.Count >= 1) double.TryParse(numbers[0].Value, out extractedLength);
+                    if (numbers.Count >= 2) double.TryParse(numbers[1].Value, out extractedWidth);
+                }
+
+                // ==========================================
+                // 3. DATATABLE RULE MATCHING ENGINE
+                // ==========================================
                 DataRow matchedSortingRule = null;
-                string currentShapeNameString = currentMode.ToString();
+                string currentShapeNameString = currentMode.ToString(); // "Round", "Pear", "Poly", "HM"
 
                 foreach (DataRow row in dtRules.Rows)
                 {
+                    // Match the shape column type first
                     if (row["ShapeType"].ToString() == currentShapeNameString)
                     {
                         double fromLen = Convert.ToDouble(row["FromLength"]);
@@ -1277,7 +1628,7 @@ namespace Matric_scope
 
                         if (currentMode == MeasurementMode.Round)
                         {
-                            if (cleanLength >= fromLen && cleanLength <= toLen)
+                            if (extractedLength >= fromLen && extractedLength <= toLen)
                             {
                                 matchedSortingRule = row;
                                 break;
@@ -1285,7 +1636,8 @@ namespace Matric_scope
                         }
                         else
                         {
-                            if (cleanLength >= fromLen && cleanLength <= toLen && cleanWidth >= fromWid && cleanWidth <= toWid)
+                            if (extractedLength >= fromLen && extractedLength <= toLen &&
+                                extractedWidth >= fromWid && extractedWidth <= toWid)
                             {
                                 matchedSortingRule = row;
                                 break;
@@ -1294,242 +1646,167 @@ namespace Matric_scope
                     }
                 }
 
-                // Handle counters persistence tracking maps and notify hardware via Serial COM
+                // ==========================================
+                // 4. HARDWARE SERIAL TRIGGER
+                // ==========================================
                 if (matchedSortingRule != null)
                 {
                     int targetSquareNumber = Convert.ToInt32(matchedSortingRule["Number"]);
-
-                    lock (counterLock)
-                    {
-                        if (lightBlinkCounters.ContainsKey(targetSquareNumber))
-                            lightBlinkCounters[targetSquareNumber]++;
-                        else
-                            lightBlinkCounters[targetSquareNumber] = 1;
-
-                        SaveCountersToFile();
-                    }
-
+                    // Dispatch command data to Arduino
                     if (isSerialConnected && arduinoPort != null && arduinoPort.IsOpen)
                     {
-                        arduinoPort.WriteLine(targetSquareNumber.ToString() + "\n");
+                        arduinoPort.Write(targetSquareNumber.ToString()); // Send 1 byte containing the square index (1-20)
                     }
                 }
             }
-            catch (Exception) { }
+            catch (Exception)
+            {
+                // Thread collision barrier protection
+            }
+            finally
+            {
+                // Safe disposal of raw source frame pointer copies
+                /*if (frame != null && !frame.IsDisposed)
+                {
+                    frame.Dispose();
+                }*/
+            }
         }
 
         private void btnCalib_Click(object sender, EventArgs e)
         {
-            resetCounts();
-            if (calibforminstance == null || calibforminstance.IsDisposed)
-            {
-                calibforminstance = new FrmCalib();
-                calibforminstance.Show(this);
-            }
-            else
-            {
-                // 3. If it is already open, restore it if minimized and bring it to the top
-                if (calibforminstance.WindowState == FormWindowState.Minimized)
-                {
-                    calibforminstance.WindowState = FormWindowState.Normal;
-                }
-                calibforminstance.BringToFront();
-            }
+            new FrmCalib().Show();
         }
 
         private void btnRound_Click(object sender, EventArgs e)
         {
+            //roundClick = true;
+            currentMode = MeasurementMode.Round;
+            label1.Text = "Mode: Auto Round Measurement";
+
             btnRound.BackgroundImage = Properties.Resources.ROUND_Select;
             btnPear.BackgroundImage = Properties.Resources.PEAR;
             btnHeart.BackgroundImage = Properties.Resources.HEART;
             btnOvel.BackgroundImage = Properties.Resources.OVAL;
             btnmarqu.BackgroundImage = Properties.Resources.MARQUISE;
             btnPoly.BackgroundImage = Properties.Resources.POLYGON;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            //resetCounts();
-            picPreview.Image = null;
-            SwitchMeasurementMode(MeasurementMode.Round);
+            btnEM.BackgroundImage = Properties.Resources.EMERALD;
         }
 
         private void btnPear_Click(object sender, EventArgs e)
         {
+            currentMode = MeasurementMode.Pear;
+            label1.Text = "Mode: Auto Pear Measurement";
+
             btnRound.BackgroundImage = Properties.Resources.ROUND;
             btnPear.BackgroundImage = Properties.Resources.PEAR_Select;
             btnHeart.BackgroundImage = Properties.Resources.HEART;
             btnOvel.BackgroundImage = Properties.Resources.OVAL;
             btnmarqu.BackgroundImage = Properties.Resources.MARQUISE;
             btnPoly.BackgroundImage = Properties.Resources.POLYGON;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            picPreview.Image = null;
-            SwitchMeasurementMode(MeasurementMode.Pear);
+            btnEM.BackgroundImage = Properties.Resources.EMERALD;
         }
 
         private void btnHeart_Click(object sender, EventArgs e)
         {
+            currentMode = MeasurementMode.Heart;
+            label1.Text = "Mode: Auto Heart Measurement";
+
             btnRound.BackgroundImage = Properties.Resources.ROUND;
             btnPear.BackgroundImage = Properties.Resources.PEAR;
             btnHeart.BackgroundImage = Properties.Resources.HEART_Select;
             btnOvel.BackgroundImage = Properties.Resources.OVAL;
             btnmarqu.BackgroundImage = Properties.Resources.MARQUISE;
             btnPoly.BackgroundImage = Properties.Resources.POLYGON;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            picPreview.Image = null;
-            SwitchMeasurementMode(MeasurementMode.Heart);
+            btnEM.BackgroundImage = Properties.Resources.EMERALD;
         }
 
         private void btnOvel_Click(object sender, EventArgs e)
         {
+            currentMode = MeasurementMode.Pear;
+            label1.Text = "Mode: Auto Ovel Measurement";
+
             btnRound.BackgroundImage = Properties.Resources.ROUND;
             btnPear.BackgroundImage = Properties.Resources.PEAR;
             btnHeart.BackgroundImage = Properties.Resources.HEART;
             btnOvel.BackgroundImage = Properties.Resources.OVAL_Select;
             btnmarqu.BackgroundImage = Properties.Resources.MARQUISE;
             btnPoly.BackgroundImage = Properties.Resources.POLYGON;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            picPreview.Image = null;
-            SwitchMeasurementMode(MeasurementMode.Oval);
+            btnEM.BackgroundImage = Properties.Resources.EMERALD;
         }
 
         private void btnPoly_Click(object sender, EventArgs e)
         {
+            currentMode = MeasurementMode.Poly;
+            label1.Text = "Mode: Auto Polygon Measurement";
+
             btnRound.BackgroundImage = Properties.Resources.ROUND;
             btnPear.BackgroundImage = Properties.Resources.PEAR;
             btnHeart.BackgroundImage = Properties.Resources.HEART;
             btnOvel.BackgroundImage = Properties.Resources.OVAL;
             btnmarqu.BackgroundImage = Properties.Resources.MARQUISE;
             btnPoly.BackgroundImage = Properties.Resources.POLYGON_Select;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            picPreview.Image = null;
-            SwitchMeasurementMode(MeasurementMode.Poly);
+            btnEM.BackgroundImage = Properties.Resources.EMERALD;
         }
 
         private void btnmarqu_Click(object sender, EventArgs e)
         {
+            currentMode = MeasurementMode.Marquise;
+            label1.Text = "Mode: Auto Marquise Measurement";
+
             btnRound.BackgroundImage = Properties.Resources.ROUND;
             btnPear.BackgroundImage = Properties.Resources.PEAR;
             btnHeart.BackgroundImage = Properties.Resources.HEART;
             btnOvel.BackgroundImage = Properties.Resources.OVAL;
             btnmarqu.BackgroundImage = Properties.Resources.MARQUISE_Select;
             btnPoly.BackgroundImage = Properties.Resources.POLYGON;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            picPreview.Image = null;
-            SwitchMeasurementMode(MeasurementMode.Marquise);
-            //TriggerAutoMeasurement(BitmapConverter.ToMat(new Bitmap("MR.png")));
+            btnEM.BackgroundImage = Properties.Resources.EMERALD;
         }
 
         private void btnEM_Click(object sender, EventArgs e)
         {
+            currentMode = MeasurementMode.Emerald;
+            label1.Text = "Mode: Auto Emrald Measurement";
+
             btnRound.BackgroundImage = Properties.Resources.ROUND;
             btnPear.BackgroundImage = Properties.Resources.PEAR;
             btnHeart.BackgroundImage = Properties.Resources.HEART;
             btnOvel.BackgroundImage = Properties.Resources.OVAL;
             btnmarqu.BackgroundImage = Properties.Resources.MARQUISE;
             btnPoly.BackgroundImage = Properties.Resources.POLYGON;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL_Selected;
-            picPreview.Image = null;
-            SwitchMeasurementMode(MeasurementMode.General);
+            btnEM.BackgroundImage = Properties.Resources.EMERALD_Select;
         }
 
         private void btnSettings_Click(object sender, EventArgs e)
         {
-            if (camsetInstance == null || camsetInstance.IsDisposed)
-            {
-                camsetInstance = new Camera_Setting1(Camera);
-                camsetInstance.Show(this);
-            }
-            else
-            {
-                if (camsetInstance.WindowState == FormWindowState.Minimized)
-                {
-                    camsetInstance.WindowState = FormWindowState.Normal;
-                }
-                camsetInstance.BringToFront();
-            }
+            new frmSettings(Camera).Show();
         }
 
         private void btnStop_Click(object sender, EventArgs e)
         {
-            //isMeasurementStopped = true;
-            currentMode = MeasurementMode.None; // Force the background state back to GeneralC
+            currentMode = MeasurementMode.None;
+            label1.Text = "Auto Measurement Stopped.";
 
-            UpdateMeasurementUI("Auto Measurement Stopped.");
-            resetCounts();
-
-            // Reset all buttons to unselected
             btnRound.BackgroundImage = Properties.Resources.ROUND;
             btnPear.BackgroundImage = Properties.Resources.PEAR;
             btnHeart.BackgroundImage = Properties.Resources.HEART;
             btnOvel.BackgroundImage = Properties.Resources.OVAL;
             btnmarqu.BackgroundImage = Properties.Resources.MARQUISE;
             btnPoly.BackgroundImage = Properties.Resources.POLYGON;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL;
-
-            // Visually highlight GeneralC as the active fallback mode
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            //btnGeneralC_Click(null,null);
-            picPreview.Image = null;
+            btnEM.BackgroundImage = Properties.Resources.EMERALD;
         }
+
+        /*private void btnHm_Click(object sender, EventArgs e)
+        {
+            currentMode = MeasurementMode.HM;
+            label1.Text = "Mode: Auto Half Moon Measurement";
+        }*/
 
         private void btnTilt_Click(object sender, EventArgs e)
         {
             //showTiltCalibration = !showTiltCalibration;
         }
 
-        private void button1_Click(object sender, EventArgs e)
-        {
-            lock (counterLock)
-            {
-                // Instantiates and opens the print dashboard window with your active counts
-                frmPrint printWindow = new frmPrint(lightBlinkCounters);
-                printWindow.ShowDialog();
-            }
-        }
-
-        private void btnGeneralC_Click(object sender, EventArgs e)
-        {
-            btnRound.BackgroundImage = Properties.Resources.ROUND;
-            btnPear.BackgroundImage = Properties.Resources.PEAR;
-            btnHeart.BackgroundImage = Properties.Resources.HEART;
-            btnOvel.BackgroundImage = Properties.Resources.OVAL;
-            btnmarqu.BackgroundImage = Properties.Resources.MARQUISE;
-            btnPoly.BackgroundImage = Properties.Resources.POLYGON;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC;
-            btnEM.BackgroundImage = Properties.Resources.GENERAL;
-            btnGeneralC.BackgroundImage = Properties.Resources.GENERALC_selected;
-            picPreview.Image = null;
-            SwitchMeasurementMode(MeasurementMode.GeneralC);
-        }
-
-        private void btnCaptureCustomShape_Click(object sender, EventArgs e)
-        {
-            Mat capturedSnapshot = new Mat();
-
-            lock (frameLock)
-            {
-                if (liveMat == null || liveMat.Empty())
-                {
-                    MessageBox.Show("No active camera frame available.");
-                    return;
-                }
-                liveMat.CopyTo(capturedSnapshot);
-            }
-
-            using (CustomShapeForm form = new CustomShapeForm(capturedSnapshot))
-            {
-                if (form.ShowDialog() == DialogResult.OK)
-                {
-                    PopulateCustomShapesMenu(); // Refresh menu with newly added shape
-                }
-            }
-        }
-        
         public string MeasureHalfMoonWithOpenCvSharp(Mat inputImage)
         {
             Mat src = inputImage.Clone();
@@ -1663,79 +1940,10 @@ namespace Matric_scope
             return $"Length: {baseLengthMM:F2} mm\n" +
                    $"Width : {heightMM:F2} mm\n" +
                    $"L/W Ratio      : {ratio:F2}";
-        
+
         }
 
-        private void button2_Click(object sender, EventArgs e)
-        {
-            string printData = "";
-
-            // Check if the UI is currently displaying a Diameter or standard Length/Width
-            if (lblLengthTitle.Text.ToLower() == "diameter")
-            {
-                printData = $"Diameter: {lblLengthVal.Text} mm";
-            }
-            else
-            {
-                // Build the 3-line string exactly as it used to be
-                printData = $"Length: {lblLengthVal.Text} mm\n" +
-                            $"Width: {lblWidthVal.Text} mm\n" +
-                            $"Ratio: {lblRatioVal.Text}";
-            }
-
-            // Pass the reconstructed string to your printing engine
-            
-
-
-
-            LabelPrintingEngine engine = new LabelPrintingEngine();
-            engine.PrintSingleDiamond(printData, targetedDevice);
-        }
-
-        private void cmbRulesFile_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            // 1. IF THE FORM IS STILL LOADING, DO NOT OVERWRITE THE REGISTRY!
-            if (isInitializing) return;
-
-            if (cmbRulesFile.SelectedItem != null)
-            {
-                currentfile = cmbRulesFile.SelectedItem.ToString();
-                new ModifyRegistry().Write("cmbFile", currentfile);
-                LoadRulesDatabase();
-            }
-        }
-
-        private void cmbRulesFile_DrawItem(object sender, DrawItemEventArgs e)
-        {
-            if (e.Index < 0) return;
-            System.Windows.Forms.ComboBox combo = sender as System.Windows.Forms.ComboBox;
-            string itemText = combo.Items[e.Index].ToString();
-            System.Drawing.Color backColor;
-            System.Drawing.Color foreColor;
-
-            if ((e.State & DrawItemState.Selected) == DrawItemState.Selected)
-            {
-                backColor = System.Drawing.Color.FromArgb(255, 128, 0);
-                foreColor = System.Drawing.Color.White;
-            }
-            else
-            {
-                backColor = combo.BackColor;
-                foreColor = combo.ForeColor;
-            }
-
-            using (SolidBrush bgBrush = new SolidBrush(backColor))
-            {
-                e.Graphics.FillRectangle(bgBrush, e.Bounds);
-            }
-            using (SolidBrush textBrush = new SolidBrush(foreColor))
-            {
-                e.Graphics.DrawString(itemText, e.Font, textBrush, e.Bounds);
-            }
-            e.DrawFocusRectangle();
-        }
-
-        public void docalibold(Bitmap bmp)
+        public void docalib(Bitmap bmp)
         {
             ModifyRegistry mr = new ModifyRegistry();
             var metrology = new ImageMetrology();
@@ -1763,19 +1971,19 @@ namespace Matric_scope
                 mr.Write("ppm", ppm);
                 this.Invoke((MethodInvoker)delegate
                 {
-                    UpdateMeasurementUI("Calibration complete");
+                    label1.Text = "Calibration complete";
                 });
             }
             else
             {
                 this.Invoke((MethodInvoker)delegate
                 {
-                    UpdateMeasurementUI("Calibration Not Done");
+                    label1.Text = "Calibration Not Done";
                 });
             }
         }
 
-        public void doMesulureold(Mat src)
+        public void doMesure(Mat src)
         {
             var metrology = new ImageMetrology();
             //Mat src = BitmapConverter.ToMat(bmp);
@@ -1791,14 +1999,13 @@ namespace Matric_scope
                 minDist: 100,
                 param1: 50,         // Higher value = filters out weak internal texture edges
                 param2: 30,         // Higher value = requires a more complete circular edge to trigger
-                minRadius: 60,
-                maxRadius: 600
+                minRadius: 100,
+                maxRadius: 500
             );
             if (circles.Length > 0)
             {
                 CircleSegment targetCircle = circles[0];
                 double realSize = metrology.GetRealDiameter(targetCircle);
-                //realSize = RoundToDecimals((float)realSize, 2);
                 // 2. DRAW SHAPES DIRECTLY ONTO THE INCOMING MAT
                 // Draw green outer ring
                 Cv2.Circle(src, (int)targetCircle.Center.X, (int)targetCircle.Center.Y, (int)targetCircle.Radius, Scalar.Lime, 1);
@@ -1806,320 +2013,19 @@ namespace Matric_scope
                 Cv2.Circle(src, (int)targetCircle.Center.X, (int)targetCircle.Center.Y, 5, Scalar.Red, -1);
                 //src.SaveImage("round.png");
                 OpenCvSharp.Point textPosition = new OpenCvSharp.Point((int)targetCircle.Center.X + 15, (int)targetCircle.Center.Y + 5);
-                Cv2.PutText(src, $"{realSize:F2} mm",textPosition,HersheyFonts.HersheySimplex,0.6,Scalar.Yellow,2);
+                Cv2.PutText(src, $"{realSize:F3} mm",textPosition,HersheyFonts.HersheySimplex,0.6,Scalar.Yellow,2);
                 src.ImWrite("Circle.png");
                 this.Invoke((MethodInvoker)delegate
                 {
-                    UpdateMeasurementUI($"Diameter : {realSize:F2} mm");
+                    label1.Text = $"Diameter : {realSize:F3} mm";
                 });
             }
             else
             {
                 this.Invoke((MethodInvoker)delegate
                 {
-                    UpdateMeasurementUI($"Diameter Not Detected");
+                    label1.Text = $"Diameter Not Detected";
                 });
-            }
-        }
-
-        /*public void docalib(Bitmap bmp)
-        {
-            ModifyRegistry mr = new ModifyRegistry();
-            Mat src = BitmapConverter.ToMat(bmp);
-            if (src.Empty()) return;
-
-            using (Mat gray = new Mat())
-            using (Mat blur = new Mat())
-            using (Mat thresh = new Mat())
-            {
-                Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-                Cv2.GaussianBlur(gray, blur, new OpenCvSharp.Size(5, 5), 0);
-
-                // Universal Otsu Thresholding
-                Cv2.Threshold(blur, thresh, 0, 255, ThresholdTypes.BinaryInv | ThresholdTypes.Otsu);
-
-                using (Mat kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(5, 5)))
-                {
-                    Cv2.MorphologyEx(thresh, thresh, MorphTypes.Close, kernel);
-                    Cv2.MorphologyEx(thresh, thresh, MorphTypes.Open, kernel);
-                }
-
-                OpenCvSharp.Point[][] contours;
-                HierarchyIndex[] hierarchy;
-                Cv2.FindContours(thresh, out contours, out hierarchy, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
-
-                if (contours.Length > 0)
-                {
-                    // Isolate the true calibration target
-                    var largestContour = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
-
-                    // FIX: Use BoundingRect instead of MinEnclosingCircle. 
-                    // This captures the exact pixel width (X) and height (Y) as seen by the camera sensor.
-                    OpenCvSharp.Rect boundingRect = Cv2.BoundingRect(largestContour);
-
-                    if (boundingRect.Width > 50 && boundingRect.Height > 50)
-                    {
-                        // Read the physical diameter of your calibration dot (e.g., 10.0 mm)
-                        double physicalDiameter = Convert.ToDouble(mr.Read("calibval"));
-
-                        // Calculate independent PPM for X and Y axes
-                        double ppmX = boundingRect.Width / physicalDiameter;
-                        double ppmY = boundingRect.Height / physicalDiameter;
-
-                        // Save both to registry
-                        mr.Write("ppmX", ppmX);
-                        mr.Write("ppmY", ppmY);
-
-                        // Draw visual verification
-                        Cv2.Rectangle(src, boundingRect, Scalar.Lime, 2, LineTypes.AntiAlias);
-
-                        int centerX = boundingRect.X + (boundingRect.Width / 2);
-                        int centerY = boundingRect.Y + (boundingRect.Height / 2);
-                        Cv2.Circle(src, centerX, centerY, 3, Scalar.Red, -1, LineTypes.AntiAlias);
-
-                        // Overlay the calculated PPMs on the image for debugging
-                        Cv2.PutText(src, $"ppmX: {ppmX:F3}", new OpenCvSharp.Point(10, 30), HersheyFonts.HersheySimplex, 0.6, Scalar.Yellow, 2);
-                        Cv2.PutText(src, $"ppmY: {ppmY:F3}", new OpenCvSharp.Point(10, 60), HersheyFonts.HersheySimplex, 0.6, Scalar.Yellow, 2);
-
-                        src.ImWrite("calib_result.png");
-
-                        this.Invoke((MethodInvoker)delegate
-                        {
-                            label1.Text = "Calibration complete";
-                        });
-                        return;
-                    }
-                }
-
-                this.Invoke((MethodInvoker)delegate
-                {
-                    label1.Text = "Calibration Not Done";
-                });
-            }
-        }*/
-
-        public void docalib(Bitmap bmp)
-        {
-            ModifyRegistry mr = new ModifyRegistry();
-            var metrology = new ImageMetrology();
-            Mat src = BitmapConverter.ToMat(bmp);
-            if (src.Empty()) return;
-
-            using (Mat gray = new Mat())
-            using (Mat blur = new Mat())
-            using (Mat thresh = new Mat())
-            {
-                Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-                Cv2.GaussianBlur(gray, blur, new OpenCvSharp.Size(5, 5), 0);
-
-                // Universal Otsu Thresholding: Instantly locks onto the object and ignores background noise/hand shadows
-                Cv2.Threshold(blur, thresh, 0, 255, ThresholdTypes.BinaryInv | ThresholdTypes.Otsu);
-
-                using (Mat kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(5, 5)))
-                {
-                    Cv2.MorphologyEx(thresh, thresh, MorphTypes.Close, kernel);
-                    Cv2.MorphologyEx(thresh, thresh, MorphTypes.Open, kernel);
-                }
-
-                OpenCvSharp.Point[][] contours;
-                HierarchyIndex[] hierarchy;
-                Cv2.FindContours(thresh, out contours, out hierarchy, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
-
-                if (contours.Length > 0)
-                {
-                    // Isolate the true calibration target by picking the largest solid object
-                    var largestContour = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
-
-                    // Fit a precise sub-pixel minimum enclosing circle around the contour
-                    Cv2.MinEnclosingCircle(largestContour, out Point2f center, out float radius);
-
-                    if (radius > 50) // Minimum pixel check to ignore tiny dust particles
-                    {
-                        double ppm = metrology.Calibrate(radius, Convert.ToDouble(mr.Read("calibval")));
-                        mr.Write("ppm", ppm);
-
-                        // Draw visual verification
-                        Cv2.Circle(src, (int)center.X, (int)center.Y, (int)radius, Scalar.Lime, 2, LineTypes.AntiAlias);
-                        Cv2.Circle(src, (int)center.X, (int)center.Y, 3, Scalar.Red, -1, LineTypes.AntiAlias);
-                        src.ImWrite("calib_result.png");
-
-                        this.Invoke((MethodInvoker)delegate
-                        {
-                            UpdateMeasurementUI("Calibration complete");
-                        });
-                        return;
-                    }
-                }
-
-                this.Invoke((MethodInvoker)delegate
-                {
-                    UpdateMeasurementUI("Calibration Not Done");
-                });
-            }
-        }
-
-        public string doMesure(Mat src)
-        {
-            var metrology = new ImageMetrology();
-            if (src == null || src.Empty()) return "";
-
-            double ppm = 1.0;
-            try
-            {
-                ppm = Convert.ToDouble(new ModifyRegistry().Read("ppm"));
-            }
-            catch
-            {
-                ppm = 1.0;
-            }
-            if (ppm <= 0) ppm = 1.0;
-
-            using (Mat gray = new Mat())
-            using (Mat blur = new Mat())
-            using (Mat thresh = new Mat())
-            {
-                Cv2.CvtColor(src, gray, ColorConversionCodes.BGR2GRAY);
-                Cv2.GaussianBlur(gray, blur, new OpenCvSharp.Size(5, 5), 0);
-
-                // Adaptive Otsu Thresholding guarantees zero fluctuation when lighting shifts or hands move
-                Cv2.Threshold(blur, thresh, 0, 255, ThresholdTypes.BinaryInv | ThresholdTypes.Otsu);
-
-                using (Mat kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new OpenCvSharp.Size(5, 5)))
-                {
-                    Cv2.MorphologyEx(thresh, thresh, MorphTypes.Close, kernel);
-                    Cv2.MorphologyEx(thresh, thresh, MorphTypes.Open, kernel);
-                }
-
-                OpenCvSharp.Point[][] contours;
-                HierarchyIndex[] hierarchy;
-                Cv2.FindContours(thresh, out contours, out hierarchy, RetrievalModes.External, ContourApproximationModes.ApproxSimple);
-
-                if (contours.Length > 0)
-                {
-                    var largestContour = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
-                    double area = Cv2.ContourArea(largestContour);
-
-                    if (area > 500) // Ignore small noise blobs
-                    {
-                        // Sub-pixel accurate bounding circle calculation
-                        Cv2.MinEnclosingCircle(largestContour, out Point2f center, out float radius);
-
-                        // Calculate diameter in millimeters using PPM
-                        double realSize = (radius * 2.0) / ppm;
-
-                        // Render Order Fix: Draw measurement overlays cleanly
-                        Cv2.Circle(src, (int)Math.Round(center.X), (int)Math.Round(center.Y), (int)Math.Round(radius), Scalar.Lime, 1, LineTypes.AntiAlias);
-                        Cv2.Circle(src, (int)Math.Round(center.X), (int)Math.Round(center.Y), 4, Scalar.Red, -1, LineTypes.AntiAlias);
-
-                        OpenCvSharp.Point textPosition = new OpenCvSharp.Point((int)Math.Round(center.X) + 15, (int)Math.Round(center.Y) + 5);
-                        Cv2.PutText(src, $"{realSize:F2} mm", textPosition, HersheyFonts.HersheySimplex, 0.6, Scalar.Yellow, 2, LineTypes.AntiAlias);
-
-                        // ==========================================================
-                        // CREATE ISOLATED SHAPE IMAGE FOR LABEL PRINTING
-                        // ==========================================================
-                        using (Mat printCanvas = new Mat(src.Size(), MatType.CV_8UC3, Scalar.White))
-                        {
-                            // Draw ONLY the shape outline in thick black
-                            Cv2.Polylines(printCanvas, new[] { largestContour }, true, Scalar.Black, 3, LineTypes.AntiAlias);
-
-                            // Find the bounding box to crop away empty white space
-                            OpenCvSharp.Rect cropRect = Cv2.BoundingRect(largestContour);
-
-                            // Add a 15-pixel margin around the shape
-                            cropRect.Inflate(15, 15);
-
-                            // Safety check: Ensure the crop box doesn't go outside the image boundaries
-                            cropRect.Intersect(new OpenCvSharp.Rect(0, 0, printCanvas.Width, printCanvas.Height));
-
-                            // Crop the canvas and save it specifically for the label printer/report
-                            using (Mat croppedForPrint = new Mat(printCanvas, cropRect))
-                            {
-                                croppedForPrint.ImWrite("ShapeForLabel.png");
-                            }
-                        }
-
-                        src.ImWrite("Circle.png");
-
-                        //this.Invoke((MethodInvoker)delegate
-                        //{
-                            return $"Diameter : {realSize:F2} mm";
-                        //});
-                        //return;
-                    }
-                }
-
-                //this.Invoke((MethodInvoker)delegate
-                //{
-                    return $"Diameter Not Detected";
-                //});
-            }
-        }
-
-        public void UpdateMeasurementUI(string resultText)
-        {
-            if (string.IsNullOrWhiteSpace(resultText)) return;
-
-            // Extract all numbers (including decimals) from the returned string
-            var numbers = System.Text.RegularExpressions.Regex.Matches(resultText, @"[\d\.]+");
-
-            // ---------------------------------------------------------
-            // SCENARIO 1: ROUND SHAPE (DIAMETER)
-            // ---------------------------------------------------------
-            // Using .ToLower() directly in the condition check
-            if (resultText.ToLower().Contains("diameter") && numbers.Count >= 1)
-            {
-                // Change the title to DIAMETER and show the value
-                lblLengthTitle.Text = "DIAMETER";
-                lblLengthVal.Text = numbers[0].Value;
-
-                // Hide the Width and Ratio labels since they don't apply to a perfect round shape
-                lblWidthTitle.Visible = false;
-                lblWidthVal.Visible = false;
-                lblRatioTitle.Visible = false;
-                lblRatioVal.Visible = false;
-            }
-            // ---------------------------------------------------------
-            // SCENARIO 2: STANDARD SHAPE (LENGTH & WIDTH)
-            // ---------------------------------------------------------
-            else if (resultText.ToLower().Contains("length") && resultText.ToLower().Contains("width") && numbers.Count >= 2)
-            {
-                // Restore standard titles and visibility
-                lblLengthTitle.Text = "LENGTH";
-                lblWidthTitle.Visible = true;
-                lblWidthVal.Visible = true;
-                lblRatioTitle.Visible = true;
-                lblRatioVal.Visible = true;
-
-                string lengthStr = numbers[0].Value;
-                string widthStr = numbers[1].Value;
-
-                lblLengthVal.Text = lengthStr;
-                lblWidthVal.Text = widthStr;
-
-                // Calculate and display the ratio
-                if (double.TryParse(lengthStr, out double len) && double.TryParse(widthStr, out double wid) && wid > 0)
-                {
-                    double ratio = len / wid;
-                    lblRatioVal.Text = ratio.ToString("F2");
-                }
-                else
-                {
-                    lblRatioVal.Text = "0.00";
-                }
-            }
-            // ---------------------------------------------------------
-            // SCENARIO 3: ERRORS OR NO SHAPE DETECTED
-            // ---------------------------------------------------------
-            else
-            {
-                lblLengthTitle.Text = "STATUS";
-                lblLengthVal.Text = "--";
-
-                // Hide other labels to keep the UI clean during an error
-                lblWidthTitle.Visible = false;
-                lblWidthVal.Visible = false;
-                lblRatioTitle.Visible = false;
-                lblRatioVal.Visible = false;
             }
         }
 
@@ -2132,7 +2038,7 @@ namespace Matric_scope
         {
             this.WindowState = FormWindowState.Minimized;
         }
-        
+
         private void panel3_MouseDown(object sender, MouseEventArgs e)
         {
             if (e.Button == MouseButtons.Left)
@@ -2145,28 +2051,6 @@ namespace Matric_scope
         private void btnBlank_Click(object sender, EventArgs e)
         {
             captureFlag = true;
-        }
-
-        private void FrmAuto_Resize(object sender, EventArgs e)
-        {
-            UpdatePictureBoxAspectRatio();
-        }
-
-        private void btnResetCounters_Click(object sender, EventArgs e)
-        {
-            resetCounts();
-        }
-
-        public void resetCounts()
-        {
-            lock (counterLock)
-            {
-                lightBlinkCounters.Clear();
-                if (File.Exists(storageFilePath))
-                {
-                    File.WriteAllText(storageFilePath, "{}");
-                }
-            }
         }
     }
 }
